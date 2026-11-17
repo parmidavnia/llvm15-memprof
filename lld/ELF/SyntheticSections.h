@@ -36,8 +36,8 @@ class Defined;
 struct PhdrEntry;
 class SymbolTableBaseSection;
 
-Optional<std::array<uint8_t, 16>> computeMemProfModuleId();
-Optional<std::array<uint8_t, 16>> collectMemProfModuleId();
+llvm::Optional<std::array<uint8_t, 16>> computeMemProfModuleId();
+llvm::Optional<std::array<uint8_t, 16>> collectMemProfModuleId();
 
 class SyntheticSection : public InputSection {
 public:
