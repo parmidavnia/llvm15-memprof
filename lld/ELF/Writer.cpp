@@ -11,6 +11,7 @@
 #include "ARMErrataFix.h"
 #include "CallGraphSort.h"
 #include "Config.h"
+#include "Driver.h"
 #include "InputFiles.h"
 #include "LinkerScript.h"
 #include "MapFile.h"
@@ -298,6 +299,17 @@ template <class ELFT> void elf::createSyntheticSections() {
   }
 
   auto add = [](SyntheticSection &sec) { inputSections.push_back(&sec); };
+
+  if (config->shared) {
+    Optional<std::array<uint8_t, 16>> collectedId = collectMemProfModuleId();
+    Optional<std::array<uint8_t, 16>> id;
+    if (const auto *ltoId = driver->getMemProfModuleId())
+      id = *ltoId;
+    if (!id)
+      id = collectedId;
+    if (id)
+      add(*make<MemProfModuleIdSection>(*id));
+  }
 
   in.shStrTab = std::make_unique<StringTableSection>(".shstrtab", false);
 

@@ -632,6 +632,9 @@ public:
   /// llvm::md5(Name).
   Expected<memprof::MemProfRecord> getMemProfRecord(uint64_t FuncNameHash);
 
+  /// Print indexed MemProf records using the raw reader's YAML record format.
+  Error printMemProfYAML(raw_ostream &OS);
+
   /// Fill Counts with the profile data for the given function name.
   Error getFunctionCounts(StringRef FuncName, uint64_t FuncHash,
                           std::vector<uint64_t> &Counts);

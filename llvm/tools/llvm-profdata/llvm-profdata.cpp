@@ -240,7 +240,7 @@ static void overlapInput(const std::string &BaseFilename,
 /// Load an input into a writer context.
 static void loadInput(const WeightedFile &Input, SymbolRemapper *Remapper,
                       const InstrProfCorrelator *Correlator,
-                      const StringRef ProfiledBinary, WriterContext *WC) {
+                      ArrayRef<StringRef> ProfiledBinaries, WriterContext *WC) {
   std::unique_lock<std::mutex> CtxGuard{WC->Lock};
 
   // Copy the filename, because llvm::ThreadPool copied the input "const
@@ -250,7 +250,8 @@ static void loadInput(const WeightedFile &Input, SymbolRemapper *Remapper,
 
   using ::llvm::memprof::RawMemProfReader;
   if (RawMemProfReader::hasFormat(Input.Filename)) {
-    auto ReaderOrErr = RawMemProfReader::create(Input.Filename, ProfiledBinary);
+    auto ReaderOrErr =
+        RawMemProfReader::create(Input.Filename, ProfiledBinaries);
     if (!ReaderOrErr) {
       exitWithError(ReaderOrErr.takeError(), Input.Filename);
     }
@@ -376,7 +377,7 @@ static void mergeInstrProfile(const WeightedFileVector &Inputs,
                               StringRef OutputFilename,
                               ProfileFormat OutputFormat, bool OutputSparse,
                               unsigned NumThreads, FailureMode FailMode,
-                              const StringRef ProfiledBinary) {
+                              ArrayRef<StringRef> ProfiledBinaries) {
   if (OutputFormat != PF_Binary && OutputFormat != PF_Compact_Binary &&
       OutputFormat != PF_Ext_Binary && OutputFormat != PF_Text)
     exitWithError("unknown format is specified");
@@ -409,7 +410,7 @@ static void mergeInstrProfile(const WeightedFileVector &Inputs,
 
   if (NumThreads == 1) {
     for (const auto &Input : Inputs)
-      loadInput(Input, Remapper, Correlator.get(), ProfiledBinary,
+      loadInput(Input, Remapper, Correlator.get(), ProfiledBinaries,
                 Contexts[0].get());
   } else {
     ThreadPool Pool(hardware_concurrency(NumThreads));
@@ -417,7 +418,7 @@ static void mergeInstrProfile(const WeightedFileVector &Inputs,
     // Load the inputs in parallel (N/NumThreads serial steps).
     unsigned Ctx = 0;
     for (const auto &Input : Inputs) {
-      Pool.async(loadInput, Input, Remapper, Correlator.get(), ProfiledBinary,
+      Pool.async(loadInput, Input, Remapper, Correlator.get(), ProfiledBinaries,
                  Contexts[Ctx].get());
       Ctx = (Ctx + 1) % NumThreads;
     }
@@ -634,7 +635,7 @@ static void supplementInstrProfile(
   SmallSet<instrprof_error, 4> WriterErrorCodes;
   auto WC = std::make_unique<WriterContext>(OutputSparse, ErrorLock,
                                             WriterErrorCodes);
-  loadInput(Inputs[0], nullptr, nullptr, /*ProfiledBinary=*/"", WC.get());
+  loadInput(Inputs[0], nullptr, nullptr, /*ProfiledBinaries=*/{}, WC.get());
   if (WC->Errors.size() > 0)
     exitWithError(std::move(WC->Errors[0].first), InstrFilename);
 
@@ -1013,11 +1014,15 @@ static int merge_main(int argc, const char *argv[]) {
   cl::opt<std::string> DebugInfoFilename(
       "debug-info", cl::init(""),
       cl::desc("Use the provided debug info to correlate the raw profile."));
-  cl::opt<std::string> ProfiledBinary(
-      "profiled-binary", cl::init(""),
-      cl::desc("Path to binary from which the profile was collected."));
+  cl::list<std::string> ProfiledBinaryPaths(
+      "profiled-binary", cl::ZeroOrMore,
+      cl::desc(
+          "Path to a profiled binary; repeat for multiple MemProf binaries."));
 
   cl::ParseCommandLineOptions(argc, argv, "LLVM profile data merger\n");
+  SmallVector<StringRef, 4> ProfiledBinaries;
+  for (const std::string &Path : ProfiledBinaryPaths)
+    ProfiledBinaries.push_back(Path);
 
   WeightedFileVector WeightedInputs;
   for (StringRef Filename : InputFilenames)
@@ -1058,7 +1063,7 @@ static int merge_main(int argc, const char *argv[]) {
   if (ProfileKind == instr)
     mergeInstrProfile(WeightedInputs, DebugInfoFilename, Remapper.get(),
                       OutputFilename, OutputFormat, OutputSparse, NumThreads,
-                      FailureMode, ProfiledBinary);
+                      FailureMode, ProfiledBinaries);
   else
     mergeSampleProfile(WeightedInputs, Remapper.get(), OutputFilename,
                        OutputFormat, ProfileSymbolListFile, CompressAllSections,
@@ -1089,7 +1094,7 @@ static void overlapInstrProfile(const std::string &BaseFilename,
     OS << "Sum of edge counts for profile " << TestFilename << " is 0.\n";
     exit(0);
   }
-  loadInput(WeightedInput, nullptr, nullptr, /*ProfiledBinary=*/"", &Context);
+  loadInput(WeightedInput, nullptr, nullptr, /*ProfiledBinaries=*/{}, &Context);
   overlapInput(BaseFilename, TestFilename, &Context, Overlap, FuncFilter, OS,
                IsCS);
   Overlap.dump(OS);
@@ -2530,10 +2535,21 @@ static int showSampleProfile(const std::string &Filename, bool ShowCounts,
 }
 
 static int showMemProfProfile(const std::string &Filename,
-                              const std::string &ProfiledBinary,
+                              ArrayRef<StringRef> ProfiledBinaries,
                               raw_fd_ostream &OS) {
+  auto BufferOr = MemoryBuffer::getFileOrSTDIN(Filename);
+  if (std::error_code EC = BufferOr.getError())
+    exitWithErrorCode(EC, Filename);
+  if (IndexedInstrProfReader::hasFormat(**BufferOr)) {
+    auto ReaderOr = IndexedInstrProfReader::create(std::move(*BufferOr));
+    if (!ReaderOr)
+      exitWithError(ReaderOr.takeError(), Filename);
+    if (Error E = (*ReaderOr)->printMemProfYAML(OS))
+      exitWithError(std::move(E), Filename);
+    return 0;
+  }
   auto ReaderOr = llvm::memprof::RawMemProfReader::create(
-      Filename, ProfiledBinary, /*KeepNames=*/true);
+      std::move(*BufferOr), ProfiledBinaries, /*KeepNames=*/true);
   if (Error E = ReaderOr.takeError())
     // Since the error can be related to the profile or the binary we do not
     // pass whence. Instead additional context is provided where necessary in
@@ -2643,11 +2659,15 @@ static int show_main(int argc, const char *argv[]) {
   cl::opt<bool> ShowCovered(
       "covered", cl::init(false),
       cl::desc("Show only the functions that have been executed."));
-  cl::opt<std::string> ProfiledBinary(
-      "profiled-binary", cl::init(""),
-      cl::desc("Path to binary from which the profile was collected."));
+  cl::list<std::string> ProfiledBinaryPaths(
+      "profiled-binary", cl::ZeroOrMore,
+      cl::desc(
+          "Path to a profiled binary; repeat for multiple MemProf binaries."));
 
   cl::ParseCommandLineOptions(argc, argv, "LLVM profile data summary\n");
+  SmallVector<StringRef, 4> ProfiledBinaries;
+  for (const std::string &Path : ProfiledBinaryPaths)
+    ProfiledBinaries.push_back(Path);
 
   if (Filename.empty() && DebugInfoFilename.empty())
     exitWithError(
@@ -2683,7 +2703,7 @@ static int show_main(int argc, const char *argv[]) {
                              ShowAllFunctions, ShowDetailedSummary,
                              ShowFunction, ShowProfileSymbolList,
                              ShowSectionInfoOnly, ShowHotFuncList, OS);
-  return showMemProfProfile(Filename, ProfiledBinary, OS);
+  return showMemProfProfile(Filename, ProfiledBinaries, OS);
 }
 
 int main(int argc, const char *argv[]) {

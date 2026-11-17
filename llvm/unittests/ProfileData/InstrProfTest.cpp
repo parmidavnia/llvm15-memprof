@@ -332,6 +332,52 @@ TEST_F(InstrProfTest, test_memprof) {
   EXPECT_THAT(WantRecord, EqualsRecord(Record));
 }
 
+TEST_F(InstrProfTest, test_memprof_multi_module_roundtrip) {
+  ASSERT_THAT_ERROR(Writer.mergeProfileKind(InstrProfKind::MemProf),
+                    Succeeded());
+  const uint8_t Module1[] = {1, 2, 3, 4};
+  const uint8_t Module2[] = {4, 3, 2, 1};
+  const uint64_t Guid1 =
+      IndexedMemProfRecord::getGUID("shared_allocate", Module1);
+  const uint64_t Guid2 =
+      IndexedMemProfRecord::getGUID("shared_allocate", Module2);
+  ASSERT_NE(Guid1, Guid2);
+  memprof::Frame Frame1(Guid1, 2, 3, false);
+  memprof::Frame Frame2(Guid2, 2, 3, false);
+  auto Id1 = Frame1.hash();
+  auto Id2 = Frame2.hash();
+  Writer.addMemProfFrame(Id1, Frame1, Err);
+  Writer.addMemProfFrame(Id2, Frame2, Err);
+  MemInfoBlock Block1, Block2;
+  Block1.AllocCount = 1;
+  Block1.TotalSize = 111;
+  Block2.AllocCount = 2;
+  Block2.TotalSize = 444;
+  Writer.addMemProfRecord(Guid1, makeRecord({{Id1}}, {}, Block1));
+  Writer.addMemProfRecord(Guid2, makeRecord({{Id2}}, {}, Block2));
+  readProfile(Writer.writeBuffer());
+  auto Record1 = Reader->getMemProfRecord(Guid1);
+  auto Record2 = Reader->getMemProfRecord(Guid2);
+  ASSERT_THAT_ERROR(Record1.takeError(), Succeeded());
+  ASSERT_THAT_ERROR(Record2.takeError(), Succeeded());
+  ASSERT_EQ(Record1->AllocSites.size(), 1U);
+  ASSERT_EQ(Record2->AllocSites.size(), 1U);
+  EXPECT_EQ(Record1->AllocSites[0].CallStack[0].Function, Guid1);
+  EXPECT_EQ(Record2->AllocSites[0].CallStack[0].Function, Guid2);
+  EXPECT_EQ(Record1->AllocSites[0].Info.getTotalSize(), 111U);
+  EXPECT_EQ(Record2->AllocSites[0].Info.getTotalSize(), 444U);
+  std::string Output;
+  raw_string_ostream OS(Output);
+  ASSERT_THAT_ERROR(Reader->printMemProfYAML(OS), Succeeded());
+  OS.flush();
+  EXPECT_NE(Output.find("NumMibInfo: 2"), std::string::npos);
+  EXPECT_NE(Output.find("NumAllocFunctions: 2"), std::string::npos);
+  EXPECT_NE(Output.find("FunctionGUID: " + std::to_string(Guid1)),
+            std::string::npos);
+  EXPECT_NE(Output.find("FunctionGUID: " + std::to_string(Guid2)),
+            std::string::npos);
+}
+
 TEST_F(InstrProfTest, test_memprof_getrecord_error) {
   ASSERT_THAT_ERROR(Writer.mergeProfileKind(InstrProfKind::MemProf),
                     Succeeded());

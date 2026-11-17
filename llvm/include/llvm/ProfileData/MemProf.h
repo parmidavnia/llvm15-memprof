@@ -389,6 +389,9 @@ struct IndexedMemProfRecord {
   // memprof, we remove any .llvm suffix added by LTO. MemProfRecords are
   // mapped to functions using this GUID.
   static GlobalValue::GUID getGUID(const StringRef FunctionName);
+  // Module-qualified identity for functions in multi-binary profiles.
+  static GlobalValue::GUID getGUID(StringRef FunctionName,
+                                   ArrayRef<uint8_t> ModuleId);
 };
 
 // Holds the memprof profile information for a function. The internal

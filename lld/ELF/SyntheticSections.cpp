@@ -35,8 +35,10 @@
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFDebugPubTable.h"
+#include "llvm/LTO/LTO.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/LEB128.h"
+#include "llvm/Support/MD5.h"
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/TimeProfiler.h"
 #include <cstdlib>
@@ -3989,3 +3991,96 @@ template class elf::PartitionProgramHeadersSection<ELF32LE>;
 template class elf::PartitionProgramHeadersSection<ELF32BE>;
 template class elf::PartitionProgramHeadersSection<ELF64LE>;
 template class elf::PartitionProgramHeadersSection<ELF64BE>;
+
+// Hash the sorted input TU identities, independently of object order and code
+// layout. Input TU notes use the standard four-byte ELF note alignment.
+static void collectMemProfTUIDs(ArrayRef<InputSectionBase *> sections,
+                                SmallVectorImpl<std::array<uint8_t, 16>> &ids,
+                                bool consume) {
+  for (InputSectionBase *sec : sections) {
+    if (!sec || sec == &InputSection::discarded || !sec->isLive() ||
+        sec->name != ".note.llvm.memprof.tu-id")
+      continue;
+    if (sec->alignment != 4) {
+      error(toString(sec) + ": MemProf TU ID note alignment must be 4");
+      continue;
+    }
+    ArrayRef<uint8_t> data = sec->data();
+    while (!data.empty()) {
+      if (data.size() < 12) {
+        error(toString(sec) + ": MemProf TU ID note header is too short");
+        break;
+      }
+      uint32_t nameSize = read32(data.data());
+      uint32_t descSize = read32(data.data() + 4);
+      uint32_t type = read32(data.data() + 8);
+      // Widen before adding/alignment to avoid malformed-note overflow.
+      uint64_t descOffset = 12 + alignTo(uint64_t(nameSize), 4);
+      uint64_t size = descOffset + alignTo(uint64_t(descSize), 4);
+      if (size > data.size()) {
+        error(toString(sec) + ": MemProf TU ID note is too short");
+        break;
+      }
+      if (nameSize != 5 || memcmp(data.data() + 12, "LLVM", 5) ||
+          type != NT_LLVM_MEMPROF_TU_ID || descSize != 16) {
+        error(toString(sec) + ": invalid MemProf TU ID note");
+        break;
+      }
+      std::array<uint8_t, 16> id;
+      llvm::copy(data.slice(descOffset, descSize), id.begin());
+      ids.push_back(id);
+      data = data.slice(size);
+    }
+    if (consume)
+      sec->markDead();
+  }
+}
+
+static Optional<std::array<uint8_t, 16>>
+hashMemProfTUIDs(SmallVectorImpl<std::array<uint8_t, 16>> &ids) {
+  if (ids.empty())
+    return None;
+  llvm::sort(ids);
+  MD5 hash;
+  for (const auto &id : ids)
+    hash.update(ArrayRef<uint8_t>(id));
+  return hash.final();
+}
+
+Optional<std::array<uint8_t, 16>> elf::computeMemProfModuleId() {
+  if (!config->shared || ctx->bitcodeFiles.empty())
+    return None;
+  SmallVector<std::array<uint8_t, 16>, 0> ids;
+  for (ELFFileBase *file : ctx->objectFiles)
+    collectMemProfTUIDs(file->getSections(), ids, /*consume=*/false);
+  for (BitcodeFile *file : ctx->bitcodeFiles) {
+    llvm::lto::InputFile &obj = *file->obj;
+    bool hasMemProfTUID = llvm::any_of(obj.symbols(), [](const auto &sym) {
+      return sym.getIRName() == "__memprof_profile_filename";
+    });
+    if (hasMemProfTUID)
+      ids.push_back(MD5::hash(arrayRefFromStringRef(obj.getSourceFileName())));
+  }
+  return hashMemProfTUIDs(ids);
+}
+
+Optional<std::array<uint8_t, 16>> elf::collectMemProfModuleId() {
+  SmallVector<std::array<uint8_t, 16>, 0> ids;
+  collectMemProfTUIDs(inputSections, ids, /*consume=*/true);
+  return hashMemProfTUIDs(ids);
+}
+
+MemProfModuleIdSection::MemProfModuleIdSection(ArrayRef<uint8_t> id)
+    : SyntheticSection(SHF_ALLOC, SHT_NOTE, 4, ".note.llvm.memprof.module-id") {
+  assert(id.size() == moduleId.size());
+  llvm::copy(id, moduleId.begin());
+}
+
+void MemProfModuleIdSection::writeTo(uint8_t *buf) {
+  write32(buf, 5);
+  write32(buf + 4, moduleId.size());
+  write32(buf + 8, NT_LLVM_MEMPROF_MODULE_ID);
+  memcpy(buf + 12, "LLVM", 5);
+  memset(buf + 17, 0, 3);
+  memcpy(buf + 20, moduleId.data(), moduleId.size());
+}

@@ -4,6 +4,7 @@
 #include "llvm/ProfileData/InstrProf.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/EndianStream.h"
+#include "llvm/Support/MD5.h"
 
 namespace llvm {
 namespace memprof {
@@ -79,6 +80,15 @@ GlobalValue::GUID IndexedMemProfRecord::getGUID(const StringRef FunctionName) {
   // thinLTO global promotion. At the time the profile is consumed,
   // these suffixes will not be present.
   return Function::getGUID(FunctionName.take_front(Pos));
+}
+
+GlobalValue::GUID IndexedMemProfRecord::getGUID(StringRef FunctionName,
+                                                ArrayRef<uint8_t> ModuleId) {
+  MD5 Hash;
+  Hash.update("MemProf module GUID");
+  Hash.update(ModuleId);
+  Hash.update(FunctionName.take_front(FunctionName.find(".llvm.")));
+  return Hash.final().low();
 }
 
 Expected<MemProfSchema> readMemProfSchema(const unsigned char *&Buffer) {

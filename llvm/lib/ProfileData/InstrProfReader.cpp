@@ -14,6 +14,8 @@
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/ProfileSummary.h"
@@ -1107,6 +1109,37 @@ IndexedInstrProfReader::getMemProfRecord(const uint64_t FuncNameHash) {
                                           Twine(LastUnmappedFrameId));
   }
   return Record;
+}
+
+Error IndexedInstrProfReader::printMemProfYAML(raw_ostream &OS) {
+  if (!MemProfRecordTable)
+    return make_error<InstrProfError>(instrprof_error::invalid_prof,
+                                      "no memprof data available in profile");
+  SmallVector<uint64_t, 0> Keys;
+  for (uint64_t Key : MemProfRecordTable->keys())
+    Keys.push_back(Key);
+  llvm::sort(Keys);
+  uint64_t NumAllocFunctions = 0, NumMibInfo = 0;
+  for (uint64_t Key : Keys) {
+    auto Record = getMemProfRecord(Key);
+    if (!Record)
+      return Record.takeError();
+    if (!Record->AllocSites.empty())
+      ++NumAllocFunctions;
+    NumMibInfo += Record->AllocSites.size();
+  }
+  OS << "---\nMemprofProfile:\n  Summary:\n"
+     << "    NumMibInfo: " << NumMibInfo << "\n"
+     << "    NumAllocFunctions: " << NumAllocFunctions << "\n"
+     << "  Records:\n";
+  for (uint64_t Key : Keys) {
+    auto Record = getMemProfRecord(Key);
+    if (!Record)
+      return Record.takeError();
+    OS << "  -\n    FunctionGUID: " << Key << "\n";
+    Record->print(OS);
+  }
+  return Error::success();
 }
 
 Error IndexedInstrProfReader::getFunctionCounts(StringRef FuncName,

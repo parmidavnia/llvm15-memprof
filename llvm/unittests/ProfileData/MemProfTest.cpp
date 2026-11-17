@@ -350,3 +350,13 @@ TEST(MemProf, SymbolizationFilter) {
               FrameContains("foo", 5U, 30U, false));
 }
 } // namespace
+
+TEST(MemProfTest, ModuleQualifiedGUID) {
+  const uint8_t Module1[] = {1, 2, 3, 4};
+  const uint8_t Module2[] = {4, 3, 2, 1};
+  auto First = IndexedMemProfRecord::getGUID("shared_allocate", Module1);
+  EXPECT_NE(First, IndexedMemProfRecord::getGUID("shared_allocate", Module2));
+  EXPECT_NE(First, IndexedMemProfRecord::getGUID("shared_allocate"));
+  EXPECT_EQ(First,
+            IndexedMemProfRecord::getGUID("shared_allocate.llvm.123", Module1));
+}

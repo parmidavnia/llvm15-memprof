@@ -287,6 +287,11 @@ void LinkerDriver::addFile(StringRef path, bool withLOption) {
   }
 }
 
+const Optional<std::array<uint8_t, 16>> *
+LinkerDriver::getMemProfModuleId() const {
+  return lto ? &lto->getMemProfModuleId() : nullptr;
+}
+
 // Add a given library by searching it from input search paths.
 void LinkerDriver::addLibrary(StringRef name) {
   if (Optional<std::string> path = searchLibrary(name))

@@ -1588,6 +1588,8 @@ enum : unsigned {
 // LLVM-specific notes.
 enum {
   NT_LLVM_HWASAN_GLOBALS = 3,
+  NT_LLVM_MEMPROF_TU_ID = 0x4d505401,
+  NT_LLVM_MEMPROF_MODULE_ID = 0x4d505402,
 };
 
 // GNU note types.

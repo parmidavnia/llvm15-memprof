@@ -14,6 +14,7 @@
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Option/ArgList.h"
+#include <array>
 
 namespace lld {
 namespace elf {
@@ -27,6 +28,7 @@ public:
   void linkerMain(ArrayRef<const char *> args);
   void addFile(StringRef path, bool withLOption);
   void addLibrary(StringRef name);
+  const llvm::Optional<std::array<uint8_t, 16>> *getMemProfModuleId() const;
 
 private:
   void createFiles(llvm::opt::InputArgList &args);

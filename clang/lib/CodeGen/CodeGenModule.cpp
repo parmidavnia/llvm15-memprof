@@ -50,6 +50,7 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/DataLayout.h"
@@ -66,6 +67,8 @@
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/X86TargetParser.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <array>
 
 using namespace clang;
 using namespace CodeGen;
@@ -75,6 +78,41 @@ static llvm::cl::opt<bool> LimitedCoverage(
     llvm::cl::desc("Emit limited coverage mapping information (experimental)"));
 
 static const char AnnotationSection[] = "llvm.metadata";
+
+static void emitMemProfTUIDNote(CodeGenModule &CGM) {
+  if (!CGM.getTriple().isOSBinFormatELF())
+    return;
+
+  const SourceManager &SM = CGM.getContext().getSourceManager();
+  Optional<FileEntryRef> MainFile = SM.getFileEntryRefForID(SM.getMainFileID());
+  if (!MainFile)
+    return;
+
+  StringRef FileName = MainFile->getName();
+  llvm::MD5::MD5Result TUID =
+      llvm::MD5::hash(llvm::arrayRefFromStringRef(FileName));
+
+  llvm::LLVMContext &Ctx = CGM.getLLVMContext();
+  constexpr std::array<uint8_t, 8> NoteNameBytes = {'L', 'L', 'V', 'M',
+                                                    0,   0,   0,   0};
+  llvm::Constant *NoteName =
+      llvm::ConstantDataArray::get(Ctx, ArrayRef<uint8_t>(NoteNameBytes));
+  llvm::Constant *NoteDesc =
+      llvm::ConstantDataArray::get(Ctx, ArrayRef<uint8_t>(TUID));
+  llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
+  llvm::Constant *Note = llvm::ConstantStruct::getAnon(
+      Ctx, {llvm::ConstantInt::get(Int32Ty, 5),
+            llvm::ConstantInt::get(Int32Ty, TUID.size()),
+            llvm::ConstantInt::get(Int32Ty, llvm::ELF::NT_LLVM_MEMPROF_TU_ID),
+            NoteName, NoteDesc});
+
+  auto *GV = new llvm::GlobalVariable(
+      CGM.getModule(), Note->getType(), /*isConstant=*/true,
+      llvm::GlobalValue::PrivateLinkage, Note, "__llvm_memprof_tu_id");
+  GV->setSection(".note.llvm.memprof.tu-id");
+  GV->setAlignment(llvm::Align(4));
+  llvm::appendToCompilerUsed(CGM.getModule(), {GV});
+}
 
 static CGCXXABI *createCXXABI(CodeGenModule &CGM) {
   switch (CGM.getContext().getCXXABIKind()) {
@@ -815,6 +853,7 @@ void CodeGenModule::Release() {
     getModule().addModuleFlag(
         llvm::Module::Error, "MemProfProfileFilename",
         llvm::MDString::get(Ctx, CodeGenOpts.MemoryProfileOutput));
+    emitMemProfTUIDNote(*this);
   }
 
   if (LangOpts.CUDAIsDevice && getTriple().isNVPTX()) {

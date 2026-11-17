@@ -24,15 +24,20 @@
 #include "InputSection.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/MC/StringTableBuilder.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Threading.h"
+#include <array>
 
 namespace lld {
 namespace elf {
 class Defined;
 struct PhdrEntry;
 class SymbolTableBaseSection;
+
+Optional<std::array<uint8_t, 16>> computeMemProfModuleId();
+Optional<std::array<uint8_t, 16>> collectMemProfModuleId();
 
 class SyntheticSection : public InputSection {
 public:
@@ -58,6 +63,16 @@ public:
 struct CieRecord {
   EhSectionPiece *cie = nullptr;
   SmallVector<EhSectionPiece *, 0> fdes;
+};
+
+class MemProfModuleIdSection final : public SyntheticSection {
+public:
+  explicit MemProfModuleIdSection(ArrayRef<uint8_t> id);
+  void writeTo(uint8_t *buf) override;
+  size_t getSize() const override { return 36; }
+
+private:
+  std::array<uint8_t, 16> moduleId;
 };
 
 // Section for .eh_frame.

@@ -11,6 +11,7 @@
 #include "InputFiles.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
+#include "SyntheticSections.h"
 #include "lld/Common/Args.h"
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Strings.h"
@@ -185,7 +186,7 @@ static lto::Config createConfig() {
   return c;
 }
 
-BitcodeCompiler::BitcodeCompiler() {
+BitcodeCompiler::BitcodeCompiler() : memProfModuleId(computeMemProfModuleId()) {
   // Initialize indexFile.
   if (!config->thinLTOIndexOnlyArg.empty())
     indexFile = openFile(config->thinLTOIndexOnlyArg);

@@ -17,8 +17,12 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/DebugInfo/Symbolize/SymbolizableModule.h"
 #include "llvm/DebugInfo/Symbolize/SymbolizableObjectFile.h"
@@ -208,35 +212,66 @@ std::string getBuildIdString(const SegmentEntry &Entry) {
   }
   return OS.str();
 }
+Expected<SmallVector<uint8_t, 16>>
+getMemProfModuleId(const object::ELF64LEFile &ElfFile) {
+  auto SectionsOr = ElfFile.sections();
+  if (!SectionsOr)
+    return SectionsOr.takeError();
+
+  for (const auto &Section : *SectionsOr) {
+    if (Section.sh_type != ELF::SHT_NOTE)
+      continue;
+
+    Error Err = Error::success();
+    for (const auto &Note : ElfFile.notes(Section, Err)) {
+      if (Note.getName() != "LLVM" ||
+          Note.getType() != ELF::NT_LLVM_MEMPROF_MODULE_ID)
+        continue;
+      // LLVM 15 requires even a successful Error to be explicitly checked.
+      consumeError(std::move(Err));
+      ArrayRef<uint8_t> Id = Note.getDesc();
+      if (Id.size() != 16)
+        return createStringError(inconvertibleErrorCode(),
+                                 "invalid MemProf module ID size: %zu",
+                                 Id.size());
+      return SmallVector<uint8_t, 16>(Id.begin(), Id.end());
+    }
+    if (Err)
+      return std::move(Err);
+  }
+  return SmallVector<uint8_t, 16>();
+}
 } // namespace
 
 Expected<std::unique_ptr<RawMemProfReader>>
-RawMemProfReader::create(const Twine &Path, const StringRef ProfiledBinary,
+RawMemProfReader::create(const Twine &Path, StringRef ProfiledBinary,
                          bool KeepName) {
+  return create(Path, ArrayRef<StringRef>(ProfiledBinary), KeepName);
+}
+
+Expected<std::unique_ptr<RawMemProfReader>>
+RawMemProfReader::create(const Twine &Path,
+                         ArrayRef<StringRef> ProfiledBinaries, bool KeepName) {
   auto BufferOr = MemoryBuffer::getFileOrSTDIN(Path);
   if (std::error_code EC = BufferOr.getError())
     return report(errorCodeToError(EC), Path.getSingleStringRef());
+  return create(std::move(*BufferOr), ProfiledBinaries, KeepName);
+}
 
-  std::unique_ptr<MemoryBuffer> Buffer(BufferOr.get().release());
+Expected<std::unique_ptr<RawMemProfReader>>
+RawMemProfReader::create(std::unique_ptr<MemoryBuffer> Buffer,
+                         ArrayRef<StringRef> ProfiledBinaries, bool KeepName) {
   if (Error E = checkBuffer(*Buffer))
-    return report(std::move(E), Path.getSingleStringRef());
-
-  if (ProfiledBinary.empty())
+    return report(std::move(E), Buffer->getBufferIdentifier());
+  if (ProfiledBinaries.empty() ||
+      llvm::any_of(ProfiledBinaries,
+                   [](StringRef Path) { return Path.empty(); }))
     return report(
         errorCodeToError(make_error_code(std::errc::invalid_argument)),
         "Path to profiled binary is empty!");
-
-  auto BinaryOr = llvm::object::createBinary(ProfiledBinary);
-  if (!BinaryOr) {
-    return report(BinaryOr.takeError(), ProfiledBinary);
-  }
-
-  // Use new here since constructor is private.
-  std::unique_ptr<RawMemProfReader> Reader(
-      new RawMemProfReader(std::move(BinaryOr.get()), KeepName));
-  if (Error E = Reader->initialize(std::move(Buffer))) {
+  std::unique_ptr<RawMemProfReader> Reader(new RawMemProfReader(KeepName));
+  if (Error E = Reader->initialize(std::move(Buffer), ProfiledBinaries))
     return std::move(E);
-  }
   return std::move(Reader);
 }
 
@@ -293,118 +328,182 @@ void RawMemProfReader::printYAML(raw_ostream &OS) {
   }
 }
 
-Error RawMemProfReader::initialize(std::unique_ptr<MemoryBuffer> DataBuffer) {
-  const StringRef FileName = Binary.getBinary()->getFileName();
+Error RawMemProfReader::initialize(std::unique_ptr<MemoryBuffer> DataBuffer,
+                                   ArrayRef<StringRef> ProfiledBinaries) {
+  // Open each profiled binary and perform the ELF and executable-segment sanity
+  // checks needed to translate runtime PCs for symbolization.
+  StringSet<> SeenBuildIds;
+  StringSet<> SeenModuleIds;
+  const bool UseModuleIds =
+      llvm::count_if(ProfiledBinaries,
+                     [](StringRef Path) { return !Path.empty(); }) > 1;
+  for (StringRef BinaryPath : ProfiledBinaries) {
+    if (BinaryPath.empty())
+      continue;
 
-  auto *ElfObject = dyn_cast<object::ELFObjectFileBase>(Binary.getBinary());
-  if (!ElfObject) {
-    return report(make_error<StringError>(Twine("Not an ELF file: "),
-                                          inconvertibleErrorCode()),
-                  FileName);
+    auto BinaryOr = object::createBinary(BinaryPath);
+    if (!BinaryOr)
+      return report(BinaryOr.takeError(), BinaryPath);
+
+    auto Module = std::make_unique<ProfiledModule>(std::move(BinaryOr.get()));
+    const StringRef FileName = Module->Binary.getBinary()->getFileName();
+
+    auto *ElfObject =
+        dyn_cast<object::ELFObjectFileBase>(Module->Binary.getBinary());
+    if (!ElfObject)
+      return report(make_error<StringError>(Twine("Not an ELF file: "),
+                                            inconvertibleErrorCode()),
+                    FileName);
+    auto *Elf64LEObject = dyn_cast<object::ELF64LEObjectFile>(ElfObject);
+    if (!Elf64LEObject)
+      return report(
+          make_error<StringError>(Twine("Not a 64-bit little-endian ELF"),
+                                  inconvertibleErrorCode()),
+          FileName);
+    const object::ELF64LEFile &ElfFile = Elf64LEObject->getELFFile();
+    auto PHdrsOr = ElfFile.program_headers();
+    if (!PHdrsOr)
+      return report(
+          make_error<StringError>(Twine("Could not read program headers: "),
+                                  inconvertibleErrorCode()),
+          FileName);
+
+    // Check whether the profiled binary was built with position independent
+    // code (PIC). Perform sanity checks for assumptions we rely on to simplify
+    // symbolization.
+    int NumExecutableSegments = 0;
+    for (const auto &Phdr : *PHdrsOr) {
+      if (Phdr.p_type != ELF::PT_LOAD || !(Phdr.p_flags & ELF::PF_X))
+        continue;
+      if (++NumExecutableSegments > 1)
+        return report(
+            make_error<StringError>("Expected only one executable load segment",
+                                    inconvertibleErrorCode()),
+            FileName);
+      // Segment will always be loaded at a page boundary, expect it to be
+      // aligned already. Assume 4K pagesize for the machine from which the
+      // profile has been collected. This should be fine for now, in case we
+      // want to support other pagesizes it can be recorded in the raw profile
+      // during collection.
+      Module->PreferredTextSegmentAddress = Phdr.p_vaddr;
+      assert(Phdr.p_vaddr == (Phdr.p_vaddr & ~(0x1000 - 1U)) &&
+             "Expect p_vaddr to always be page aligned");
+    }
+    if (NumExecutableSegments == 0)
+      return report(make_error<StringError>(Twine("No executable load segment"),
+                                            inconvertibleErrorCode()),
+                    FileName);
+
+    auto Triple = ElfObject->makeTriple();
+    if (!Triple.isX86())
+      return report(make_error<StringError>(Twine("Unsupported target: ") +
+                                                Triple.getArchName(),
+                                            inconvertibleErrorCode()),
+                    FileName);
+
+    auto *Object = cast<object::ObjectFile>(Module->Binary.getBinary());
+    BuildIDRef BinaryId = getBuildID(Object);
+    if (BinaryId.empty())
+      return make_error<StringError>(Twine("No build ID found in binary ") +
+                                         FileName,
+                                     inconvertibleErrorCode());
+    std::string BuildIdString = toHex(BinaryId, /*LowerCase=*/true);
+    if (!SeenBuildIds.insert(BuildIdString).second)
+      return make_error<StringError>(
+          Twine("Duplicate profiled binary build id: ") + BuildIdString,
+          inconvertibleErrorCode());
+    Module->BuildId.assign(BinaryId.begin(), BinaryId.end());
+
+    if (UseModuleIds) {
+      auto ModuleIdOr = getMemProfModuleId(ElfFile);
+      if (!ModuleIdOr)
+        return report(ModuleIdOr.takeError(), FileName);
+      if (ModuleIdOr->empty())
+        return make_error<StringError>(
+            Twine("No MemProf module ID found in binary ") + FileName,
+            inconvertibleErrorCode());
+      std::string ModuleIdString = toHex(*ModuleIdOr, /*LowerCase=*/true);
+      if (!SeenModuleIds.insert(ModuleIdString).second)
+        return make_error<StringError>(
+            Twine("Duplicate profiled binary MemProf module id: ") +
+                ModuleIdString,
+            inconvertibleErrorCode());
+      Module->ModuleId = std::move(*ModuleIdOr);
+    }
+    ProfiledModules.push_back(std::move(Module));
   }
 
-  auto Triple = ElfObject->makeTriple();
-  if (!Triple.isX86())
-    return report(make_error<StringError>(Twine("Unsupported target: ") +
-                                              Triple.getArchName(),
-                                          inconvertibleErrorCode()),
-                  FileName);
-
+  // Process the raw profile.
   if (Error E = readRawProfile(std::move(DataBuffer)))
     return E;
 
   if (Error E = setupForSymbolization())
     return E;
 
-  auto *Object = cast<object::ObjectFile>(Binary.getBinary());
-  std::unique_ptr<DIContext> Context = DWARFContext::create(
-      *Object, DWARFContext::ProcessDebugRelocations::Process);
-
-  auto SOFOr = symbolize::SymbolizableObjectFile::create(
-      Object, std::move(Context), /*UntagAddresses=*/false);
-  if (!SOFOr)
-    return report(SOFOr.takeError(), FileName);
-  Symbolizer = std::move(SOFOr.get());
+  // Create a symbolizer for every supplied module after its build ID has been
+  // matched to the raw profile. The module keeps the binary and symbolizer
+  // alive throughout frame processing.
+  for (auto &Module : ProfiledModules) {
+    auto *Object = cast<object::ObjectFile>(Module->Binary.getBinary());
+    std::unique_ptr<DIContext> Context = DWARFContext::create(
+        *Object, DWARFContext::ProcessDebugRelocations::Process);
+    auto SOFOr = symbolize::SymbolizableObjectFile::create(
+        Object, std::move(Context), /*UntagAddresses=*/false);
+    if (!SOFOr)
+      return report(SOFOr.takeError(),
+                    Module->Binary.getBinary()->getFileName());
+    Module->Symbolizer = std::move(SOFOr.get());
+  }
 
   if (Error E = symbolizeAndFilterStackFrames())
     return E;
+
+  // Symbolization is complete, so release the symbolizers and their DWARF
+  // contexts before mapping the raw profile into records. This reduces peak
+  // memory usage because these objects are no longer needed.
+  for (auto &Module : ProfiledModules)
+    Module->Symbolizer.reset();
 
   return mapRawProfileToRecords();
 }
 
 Error RawMemProfReader::setupForSymbolization() {
-  auto *Object = cast<object::ObjectFile>(Binary.getBinary());
-  BuildIDRef BinaryId = getBuildID(Object);
-  if (BinaryId.empty())
-    return make_error<StringError>(Twine("No build id found in binary ") +
-                                       Binary.getBinary()->getFileName(),
-                                   inconvertibleErrorCode());
+  for (auto &Module : ProfiledModules) {
+    const StringRef FileName = Module->Binary.getBinary()->getFileName();
 
-  auto SetupFromELF = [&](const auto &ElfFile) -> Error {
-    auto PHdrsOr = ElfFile.program_headers();
-    if (!PHdrsOr)
-      return make_error<StringError>(Twine("Could not read program headers: "),
-                                     inconvertibleErrorCode());
-
-    int NumExecutableSegments = 0;
-    for (const auto &Phdr : *PHdrsOr) {
-      if (Phdr.p_type == ELF::PT_LOAD && (Phdr.p_flags & ELF::PF_X)) {
-        // We assume only one text segment in the main binary for simplicity and
-        // reduce the overhead of checking multiple ranges during symbolization.
-        if (++NumExecutableSegments > 1)
-          return make_error<StringError>(
-              "Expect only one executable load segment in the binary",
-              inconvertibleErrorCode());
-
-        // Segment will always be loaded at a page boundary, expect it to be
-        // aligned already. Assume 4K pagesize for the machine from which the
-        // profile has been collected. This should be fine for now, in case we
-        // want to support other pagesizes it can be recorded in the raw profile
-        // during collection.
-        PreferredTextSegmentAddress = Phdr.p_vaddr;
-        assert(Phdr.p_vaddr == (Phdr.p_vaddr & ~(0x1000 - 1U)) &&
-               "Expect p_vaddr to always be page aligned");
-        assert(Phdr.p_offset == 0 && "Expect p_offset = 0 for symbolization.");
-      }
-    }
-
+    // A build ID identifies the runtime mapping belonging to this binary. We
+    // currently support one executable segment per supplied module.
+    int NumMatched = 0;
     for (const auto &Entry : SegmentInfo) {
-      llvm::ArrayRef<uint8_t> SegmentId(Entry.BuildId, Entry.BuildIdSize);
-      if (BinaryId == SegmentId) {
-        ProfiledTextSegmentStart = Entry.Start;
-        ProfiledTextSegmentEnd = Entry.End;
-        return Error::success();
-      }
+      ArrayRef<uint8_t> SegmentId(Entry.BuildId, Entry.BuildIdSize);
+      if (ArrayRef<uint8_t>(Module->BuildId) != SegmentId)
+        continue;
+      if (++NumMatched > 1)
+        return make_error<StringError>(
+            Twine("Expected only one executable segment for binary ") +
+                FileName,
+            inconvertibleErrorCode());
+      if (Entry.Start >= Entry.End)
+        return make_error<StringError>("Invalid executable segment range",
+                                       inconvertibleErrorCode());
+      Module->ProfiledTextSegmentStart = Entry.Start;
+      Module->ProfiledTextSegmentEnd = Entry.End;
     }
-
-    return Error::success();
-  };
-
-  if (auto *O = dyn_cast<object::ELFObjectFile<object::ELF32LE>>(Object)) {
-    if (Error E = SetupFromELF(O->getELFFile()))
-      return E;
-  } else if (auto *O = dyn_cast<object::ELFObjectFile<object::ELF32BE>>(Object)) {
-    if (Error E = SetupFromELF(O->getELFFile()))
-      return E;
-  } else if (auto *O =
-                 dyn_cast<object::ELFObjectFile<object::ELF64LE>>(Object)) {
-    if (Error E = SetupFromELF(O->getELFFile()))
-      return E;
-  } else if (auto *O =
-                 dyn_cast<object::ELFObjectFile<object::ELF64BE>>(Object)) {
-    if (Error E = SetupFromELF(O->getELFFile()))
-      return E;
-  } else {
-    return make_error<StringError>(Twine("Not an ELF file: "),
-                                   inconvertibleErrorCode());
+    if (NumMatched == 0)
+      return make_error<StringError>(
+          Twine("No matching executable segments found in binary ") + FileName,
+          inconvertibleErrorCode());
   }
 
-  if (ProfiledTextSegmentStart == 0 && ProfiledTextSegmentEnd == 0)
-    return make_error<StringError>(
-        Twine("No matching executable segments found in binary ") +
-            Binary.getBinary()->getFileName(),
-        inconvertibleErrorCode());
-
+  std::sort(ProfiledModules.begin(), ProfiledModules.end(),
+            [](const auto &LHS, const auto &RHS) {
+              return LHS->ProfiledTextSegmentEnd < RHS->ProfiledTextSegmentEnd;
+            });
+  for (size_t I = 1; I < ProfiledModules.size(); ++I)
+    if (ProfiledModules[I]->ProfiledTextSegmentStart <
+        ProfiledModules[I - 1]->ProfiledTextSegmentEnd)
+      return make_error<StringError>("Overlapping profiled executable segments",
+                                     inconvertibleErrorCode());
   return Error::success();
 }
 
@@ -510,14 +609,27 @@ Error RawMemProfReader::symbolizeAndFilterStackFrames() {
           AllVAddrsToDiscard.contains(VAddr))
         continue;
 
-      Expected<DIInliningInfo> DIOr = Symbolizer->symbolizeInlinedCode(
-          getModuleOffset(VAddr), Specifier, /*UseSymbolTable=*/false);
+      ProfiledModule *Module = nullptr;
+      symbolize::SymbolizableModule *FrameSymbolizer = Symbolizer.get();
+      object::SectionedAddress Address{VAddr};
+      if (!FrameSymbolizer) {
+        Module = findModule(VAddr);
+        if (!Module) {
+          AllVAddrsToDiscard.insert(VAddr);
+          continue;
+        }
+        FrameSymbolizer = Module->Symbolizer.get();
+        Address = getModuleOffset(VAddr, *Module);
+      }
+      Expected<DIInliningInfo> DIOr = FrameSymbolizer->symbolizeInlinedCode(
+          Address, Specifier, /*UseSymbolTable=*/false);
       if (!DIOr)
         return DIOr.takeError();
       DIInliningInfo DI = DIOr.get();
 
       // Drop frames which we can't symbolize or if they belong to the runtime.
-      if (DI.getFrame(0).FunctionName == DILineInfo::BadString ||
+      if (DI.getNumberOfFrames() == 0 ||
+          DI.getFrame(0).FunctionName == DILineInfo::BadString ||
           isRuntimePath(DI.getFrame(0).FileName)) {
         AllVAddrsToDiscard.insert(VAddr);
         continue;
@@ -526,9 +638,17 @@ Error RawMemProfReader::symbolizeAndFilterStackFrames() {
       for (size_t I = 0, NumFrames = DI.getNumberOfFrames(); I < NumFrames;
            I++) {
         const auto &DIFrame = DI.getFrame(I);
+        // Qualify names with a stable module identity only for multi-binary
+        // profiles. Retain legacy GUIDs for single-binary profiles and mocks.
         const uint64_t Guid =
-            IndexedMemProfRecord::getGUID(DIFrame.FunctionName);
-        const Frame F(Guid, DIFrame.Line - DIFrame.StartLine, DIFrame.Column,
+            Module && ProfiledModules.size() > 1
+                ? IndexedMemProfRecord::getGUID(DIFrame.FunctionName,
+                                                Module->ModuleId)
+                : IndexedMemProfRecord::getGUID(DIFrame.FunctionName);
+        const uint32_t LineOffset = DIFrame.Line >= DIFrame.StartLine
+                                        ? DIFrame.Line - DIFrame.StartLine
+                                        : 0;
+        const Frame F(Guid, LineOffset, DIFrame.Column,
                       // Only the last entry is not an inlined location.
                       I != NumFrames - 1);
         // Here we retain a mapping from the GUID to symbol name instead of
@@ -616,16 +736,27 @@ Error RawMemProfReader::readRawProfile(
   return Error::success();
 }
 
-object::SectionedAddress
-RawMemProfReader::getModuleOffset(const uint64_t VirtualAddress) {
-  if (VirtualAddress >= ProfiledTextSegmentStart &&
-      VirtualAddress < ProfiledTextSegmentEnd)
-    return object::SectionedAddress{
-        VirtualAddress - ProfiledTextSegmentStart + PreferredTextSegmentAddress};
+RawMemProfReader::ProfiledModule *
+RawMemProfReader::findModule(uint64_t VirtualAddress) const {
+  auto It = std::upper_bound(
+      ProfiledModules.begin(), ProfiledModules.end(), VirtualAddress,
+      [](uint64_t Address, const std::unique_ptr<ProfiledModule> &Module) {
+        return Address < Module->ProfiledTextSegmentEnd;
+      });
+  if (It == ProfiledModules.end() ||
+      VirtualAddress < (*It)->ProfiledTextSegmentStart)
+    return nullptr;
+  return It->get();
+}
 
-  // Addresses which do not originate from the profiled binary are not adjusted.
-  // These will fail symbolization and be filtered out during processing.
-  return object::SectionedAddress{VirtualAddress};
+object::SectionedAddress
+RawMemProfReader::getModuleOffset(uint64_t VirtualAddress,
+                                  const ProfiledModule &Module) const {
+  assert(VirtualAddress >= Module.ProfiledTextSegmentStart &&
+         VirtualAddress < Module.ProfiledTextSegmentEnd);
+  return object::SectionedAddress{VirtualAddress -
+                                  Module.ProfiledTextSegmentStart +
+                                  Module.PreferredTextSegmentAddress};
 }
 
 Error RawMemProfReader::readNextRecord(GuidMemProfRecordPair &GuidRecord) {

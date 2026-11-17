@@ -22,8 +22,10 @@
 
 #include "lld/Common/LLVM.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/raw_ostream.h"
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -47,8 +49,12 @@ public:
 
   void add(BitcodeFile &f);
   std::vector<InputFile *> compile();
+  const llvm::Optional<std::array<uint8_t, 16>> &getMemProfModuleId() const {
+    return memProfModuleId;
+  }
 
 private:
+  llvm::Optional<std::array<uint8_t, 16>> memProfModuleId;
   std::unique_ptr<llvm::lto::LTO> ltoObj;
   std::vector<SmallString<0>> buf;
   std::vector<std::unique_ptr<MemoryBuffer>> files;
