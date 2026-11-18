@@ -3992,8 +3992,11 @@ template class elf::PartitionProgramHeadersSection<ELF32BE>;
 template class elf::PartitionProgramHeadersSection<ELF64LE>;
 template class elf::PartitionProgramHeadersSection<ELF64BE>;
 
-// Hash the sorted input TU identities, independently of object order and code
-// layout. Input TU notes use the standard four-byte ELF note alignment.
+// These helpers provide the identity data for the synthetic module-ID section.
+// Read Clang's object-level TU notes for both the pre-LTO and final native-link
+// paths. Keeping one parser makes those two paths agree on the input identities.
+// consume is false while inspecting original inputs and true when replacing
+// object notes with the final library note. Only live, participating notes count.
 static void collectMemProfTUIDs(ArrayRef<InputSectionBase *> sections,
                                 SmallVectorImpl<std::array<uint8_t, 16>> &ids,
                                 bool consume) {
@@ -4005,6 +4008,8 @@ static void collectMemProfTUIDs(ArrayRef<InputSectionBase *> sections,
       error(toString(sec) + ": MemProf TU ID note alignment must be 4");
       continue;
     }
+    // Validate each note before trusting its boundaries or digest. A malformed
+    // identity must fail the link rather than silently join the wrong profiles.
     ArrayRef<uint8_t> data = sec->data();
     while (!data.empty()) {
       if (data.size() < 12) {
@@ -4031,11 +4036,16 @@ static void collectMemProfTUIDs(ArrayRef<InputSectionBase *> sections,
       ids.push_back(id);
       data = data.slice(size);
     }
+    // Once the final digest is available, keep only the library-level note in
+    // the output. The earlier pre-LTO inspection must leave inputs intact.
     if (consume)
       sec->markDead();
   }
 }
 
+// Treat the input identities as an order-independent list: rearranging linker
+// arguments should not rename a library. Multiplicity is retained, so this is
+// not a deduplicated set. No identities means no new note for an ordinary link.
 static Optional<std::array<uint8_t, 16>>
 hashMemProfTUIDs(SmallVectorImpl<std::array<uint8_t, 16>> &ids) {
   if (ids.empty())
@@ -4047,6 +4057,10 @@ hashMemProfTUIDs(SmallVectorImpl<std::array<uint8_t, 16>> &ids) {
   return hash.final();
 }
 
+// Before LTO, native inputs already have notes but bitcode inputs have not all
+// become native objects. Reconstruct bitcode TU identities from source filenames
+// for modules marked for MemProf, then combine both kinds of input consistently.
+// This identifies collection builds; it does not add a MemProf profile-use pass.
 Optional<std::array<uint8_t, 16>> elf::computeMemProfModuleId() {
   if (!config->shared || ctx->bitcodeFiles.empty())
     return None;
@@ -4055,6 +4069,8 @@ Optional<std::array<uint8_t, 16>> elf::computeMemProfModuleId() {
     collectMemProfTUIDs(file->getSections(), ids, /*consume=*/false);
   for (BitcodeFile *file : ctx->bitcodeFiles) {
     llvm::lto::InputFile &obj = *file->obj;
+    // The profiling pass's filename symbol marks participating bitcode. Match
+    // Clang's filename hashing rather than hashing LTO's temporary output name.
     bool hasMemProfTUID = llvm::any_of(obj.symbols(), [](const auto &sym) {
       return sym.getIRName() == "__memprof_profile_filename";
     });
@@ -4064,18 +4080,25 @@ Optional<std::array<uint8_t, 16>> elf::computeMemProfModuleId() {
   return hashMemProfTUIDs(ids);
 }
 
+// Final native-input collection supplies the ID when no pre-LTO ID was saved.
+// Writer still calls this on LTO links to remove the now-redundant TU notes.
 Optional<std::array<uint8_t, 16>> elf::collectMemProfModuleId() {
   SmallVector<std::array<uint8_t, 16>, 0> ids;
   collectMemProfTUIDs(inputSections, ids, /*consume=*/true);
   return hashMemProfTUIDs(ids);
 }
 
+// SHF_ALLOC keeps the note with the loaded image, while SHT_NOTE lets ELF tools
+// and the reader recognize it as metadata rather than executable program data.
 MemProfModuleIdSection::MemProfModuleIdSection(ArrayRef<uint8_t> id)
     : SyntheticSection(SHF_ALLOC, SHT_NOTE, 4, ".note.llvm.memprof.module-id") {
   assert(id.size() == moduleId.size());
   llvm::copy(id, moduleId.begin());
 }
 
+// Serialize the note contract shared with Clang and RawMemProfReader. The target
+// write32 helper supplies ELF byte order; the digest itself is an opaque byte
+// sequence, with an LLVM owner name distinguishing it from a GNU build-ID note.
 void MemProfModuleIdSection::writeTo(uint8_t *buf) {
   write32(buf, 5);
   write32(buf + 4, moduleId.size());

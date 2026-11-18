@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+// Borrow a caller-owned list of binary paths without prescribing its container.
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
@@ -58,9 +59,14 @@ public:
   static Expected<std::unique_ptr<RawMemProfReader>>
   create(const Twine &Path, const StringRef ProfiledBinary,
          bool KeepName = false);
+  // This reader converts runtime addresses into the MemProf records consumed
+  // by llvm-profdata. Supply every DSO whose frames should be retained; the
+  // single-binary overload above remains available to existing callers.
   static Expected<std::unique_ptr<RawMemProfReader>>
   create(const Twine &Path, ArrayRef<StringRef> ProfiledBinaries,
          bool KeepName = false);
+  // Accept an already-read profile for format-dispatching callers such as
+  // show --memory. Ownership transfer also avoids trying to read stdin twice.
   static Expected<std::unique_ptr<RawMemProfReader>>
   create(std::unique_ptr<MemoryBuffer> Buffer,
          ArrayRef<StringRef> ProfiledBinaries, bool KeepName = false);
@@ -108,7 +114,11 @@ public:
   }
 
 private:
+  // Keep image-specific state together. The process may load several DSOs
+  // with identical symbol names, so a PC must select both its owning image
+  // and that image's debug information before we can construct a frame.
   struct ProfiledModule {
+    // Take ownership first so symbolization never outlives the object bytes.
     explicit ProfiledModule(object::OwningBinary<object::Binary> &&Bin)
         : Binary(std::move(Bin)) {}
 
@@ -117,12 +127,14 @@ private:
     object::OwningBinary<object::Binary> Binary;
     // Symbolizer created from this module's object file and DWARF context.
     std::unique_ptr<symbolize::SymbolizableModule> Symbolizer;
-    // Build ID used to match this module to its raw-profile segment.
+    // Build ID connects this exact binary build to its recorded runtime range.
+    // It answers where this image was loaded, not its identity across builds.
     llvm::SmallVector<uint8_t, 20> BuildId;
-    // Stable module ID used to distinguish equal function names when multiple
-    // profiled modules are supplied.
+    // Stable module ID answers which library a function belongs to. Unlike
+    // BuildId, it is derived from source composition rather than generated code.
     llvm::SmallVector<uint8_t, 16> ModuleId;
-    // Preferred address of the executable segment in the ELF file.
+    // The ELF-side address anchors translation from randomized runtime PCs
+    // back to the coordinates used by this image's debug information.
     uint64_t PreferredTextSegmentAddress = 0;
     // Runtime address range of this module's executable segment, recovered
     // from the raw profile by matching the build ID.
@@ -130,8 +142,11 @@ private:
     uint64_t ProfiledTextSegmentEnd = 0;
   };
 
+  // Factories create an empty reader, then validate and populate all modules
+  // together. This replaces the old assumption of one constructor-owned image.
   explicit RawMemProfReader(bool KeepName) : KeepSymbolName(KeepName) {}
-  // Initializes the RawMemProfReader with the contents in `DataBuffer`.
+  // Open the supplied images, read mappings from DataBuffer, then symbolize
+  // stacks and assemble records. Keep raw decoding separate from image lookup.
   Error initialize(std::unique_ptr<MemoryBuffer> DataBuffer,
                    ArrayRef<StringRef> ProfiledBinaries);
   // Read and parse the contents of the `DataBuffer` as a binary format profile.
@@ -145,8 +160,8 @@ private:
   // `FunctionProfileData` map. A function may have allocation profile data or
   // callsite data or both.
   Error mapRawProfileToRecords();
-  // Check build ids in the raw profile and identify the text segment for the
-  // profiled binary.
+  // Match every supplied image to its runtime text segment by build ID and
+  // establish unambiguous ranges before any address is routed to a symbolizer.
   Error setupForSymbolization();
 
   // A helper method to extract the frame from the IdToFrame map.
@@ -156,10 +171,16 @@ private:
     return It->getSecond();
   }
 
+  // Translate a PC only after its owner has been chosen; the same numerical
+  // object-relative offset may be valid in several different DSOs.
   object::SectionedAddress getModuleOffset(uint64_t VirtualAddress,
                                            const ProfiledModule &Module) const;
+  // Return the image owning this runtime PC, or nullptr for unlisted images.
+  // Depends on setupForSymbolization sorting the half-open executable ranges.
   ProfiledModule *findModule(uint64_t VirtualAddress) const;
 
+  // Own all binary/debug contexts for this reader, sorted by runtime range end
+  // after setup. Object addresses stay stable while the owning pointers move.
   SmallVector<std::unique_ptr<ProfiledModule>, 4> ProfiledModules;
   // Used only by the mock-symbolizer unit-test constructor.
   std::unique_ptr<llvm::symbolize::SymbolizableModule> Symbolizer;

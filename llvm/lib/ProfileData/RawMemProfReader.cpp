@@ -212,6 +212,10 @@ std::string getBuildIdString(const SegmentEntry &Entry) {
   }
   return OS.str();
 }
+// This file connects raw process addresses to source-level MemProf records.
+// Read the library identity emitted by LLD, separate from the GNU build ID used
+// to locate the image in memory. Absence is reported to the caller as an empty
+// ID; a malformed note is an error, since guessing could combine unrelated data.
 Expected<SmallVector<uint8_t, 16>>
 getMemProfModuleId(const object::ELF64LEFile &ElfFile) {
   auto SectionsOr = ElfFile.sections();
@@ -246,10 +250,14 @@ getMemProfModuleId(const object::ELF64LEFile &ElfFile) {
 Expected<std::unique_ptr<RawMemProfReader>>
 RawMemProfReader::create(const Twine &Path, StringRef ProfiledBinary,
                          bool KeepName) {
+  // Preserve the old entry point while sharing all validation and processing
+  // with the multi-image reader. A one-image list retains name-only GUIDs.
   return create(Path, ArrayRef<StringRef>(ProfiledBinary), KeepName);
 }
 
 Expected<std::unique_ptr<RawMemProfReader>>
+// The path factory handles I/O only; the owning-buffer factory is also usable
+// after llvm-profdata has inspected the input format, including stdin inputs.
 RawMemProfReader::create(const Twine &Path,
                          ArrayRef<StringRef> ProfiledBinaries, bool KeepName) {
   auto BufferOr = MemoryBuffer::getFileOrSTDIN(Path);
@@ -269,6 +277,8 @@ RawMemProfReader::create(std::unique_ptr<MemoryBuffer> Buffer,
     return report(
         errorCodeToError(make_error_code(std::errc::invalid_argument)),
         "Path to profiled binary is empty!");
+  // Construct only after checking the input contract. initialize owns opening
+  // and matching all binaries so a partially valid image list cannot be used.
   std::unique_ptr<RawMemProfReader> Reader(new RawMemProfReader(KeepName));
   if (Error E = Reader->initialize(std::move(Buffer), ProfiledBinaries))
     return std::move(E);
@@ -332,8 +342,12 @@ Error RawMemProfReader::initialize(std::unique_ptr<MemoryBuffer> DataBuffer,
                                    ArrayRef<StringRef> ProfiledBinaries) {
   // Open each profiled binary and perform the ELF and executable-segment sanity
   // checks needed to translate runtime PCs for symbolization.
+  // Two supplied images must not claim the same mapping or function namespace.
+  // Duplicate checks turn ambiguous inputs into errors before records are made.
   StringSet<> SeenBuildIds;
   StringSet<> SeenModuleIds;
+  // Keep historical single-binary profiles compatible. With multiple images,
+  // name-only GUIDs could merge identically named functions across libraries.
   const bool UseModuleIds =
       llvm::count_if(ProfiledBinaries,
                      [](StringRef Path) { return !Path.empty(); }) > 1;
@@ -354,6 +368,8 @@ Error RawMemProfReader::initialize(std::unique_ptr<MemoryBuffer> DataBuffer,
       return report(make_error<StringError>(Twine("Not an ELF file: "),
                                             inconvertibleErrorCode()),
                     FileName);
+    // The port supports the ELF layout used by the x86-64 MemProf runtime.
+    // Validate it before accessing the program headers through that concrete API.
     auto *Elf64LEObject = dyn_cast<object::ELF64LEObjectFile>(ElfObject);
     if (!Elf64LEObject)
       return report(
@@ -402,6 +418,8 @@ Error RawMemProfReader::initialize(std::unique_ptr<MemoryBuffer> DataBuffer,
                     FileName);
 
     auto *Object = cast<object::ObjectFile>(Module->Binary.getBinary());
+    // Use the code-dependent build ID to match the exact image recorded by the
+    // runtime. This is deliberately different from the stable ID used for GUIDs.
     BuildIDRef BinaryId = getBuildID(Object);
     if (BinaryId.empty())
       return make_error<StringError>(Twine("No build ID found in binary ") +
@@ -414,6 +432,8 @@ Error RawMemProfReader::initialize(std::unique_ptr<MemoryBuffer> DataBuffer,
           inconvertibleErrorCode());
     Module->BuildId.assign(BinaryId.begin(), BinaryId.end());
 
+    // A multi-image profile needs the linker-emitted identity for every input.
+    // Fail rather than silently reverting to colliding name-only function IDs.
     if (UseModuleIds) {
       auto ModuleIdOr = getMemProfModuleId(ElfFile);
       if (!ModuleIdOr)
@@ -495,6 +515,8 @@ Error RawMemProfReader::setupForSymbolization() {
           inconvertibleErrorCode());
   }
 
+  // Frame lookup searches by range end. Reject empty or overlapping ranges
+  // instead of allowing the supplied image order to decide ownership of a PC.
   std::sort(ProfiledModules.begin(), ProfiledModules.end(),
             [](const auto &LHS, const auto &RHS) {
               return LHS->ProfiledTextSegmentEnd < RHS->ProfiledTextSegmentEnd;
@@ -609,6 +631,9 @@ Error RawMemProfReader::symbolizeAndFilterStackFrames() {
           AllVAddrsToDiscard.contains(VAddr))
         continue;
 
+      // Unit tests may provide one mock symbolizer directly. Production reads
+      // instead route each PC through its matched image; unlisted images have
+      // no supplied debug information and their frames are filtered out.
       ProfiledModule *Module = nullptr;
       symbolize::SymbolizableModule *FrameSymbolizer = Symbolizer.get();
       object::SectionedAddress Address{VAddr};
@@ -645,6 +670,8 @@ Error RawMemProfReader::symbolizeAndFilterStackFrames() {
                 ? IndexedMemProfRecord::getGUID(DIFrame.FunctionName,
                                                 Module->ModuleId)
                 : IndexedMemProfRecord::getGUID(DIFrame.FunctionName);
+        // Compiler-generated locations can precede a reported function start.
+        // Clamp those to zero rather than recording a wrapped unsigned offset.
         const uint32_t LineOffset = DIFrame.Line >= DIFrame.StartLine
                                         ? DIFrame.Line - DIFrame.StartLine
                                         : 0;
@@ -737,6 +764,9 @@ Error RawMemProfReader::readRawProfile(
 }
 
 RawMemProfReader::ProfiledModule *
+// setupForSymbolization sorts by range end. Skip ranges ending at or before
+// this PC, then check the start as well so gaps are not assigned to a DSO.
+// Runtime ranges are half-open: [start, end), matching this older raw writer.
 RawMemProfReader::findModule(uint64_t VirtualAddress) const {
   auto It = std::upper_bound(
       ProfiledModules.begin(), ProfiledModules.end(), VirtualAddress,
@@ -750,6 +780,9 @@ RawMemProfReader::findModule(uint64_t VirtualAddress) const {
 }
 
 object::SectionedAddress
+// Undo the image's runtime relocation using its own ELF text address. This
+// supports randomized DSO/PIE placement without assuming a zero file offset;
+// the selected symbolizer then receives an address in its binary's coordinates.
 RawMemProfReader::getModuleOffset(uint64_t VirtualAddress,
                                   const ProfiledModule &Module) const {
   assert(VirtualAddress >= Module.ProfiledTextSegmentStart &&

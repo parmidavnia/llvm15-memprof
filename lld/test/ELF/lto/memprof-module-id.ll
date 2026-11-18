@@ -1,3 +1,7 @@
+; Exercise the pre-LTO identity snapshot using minimal bitcode inputs.
+; Full LTO and ThinLTO may produce different code and object partitions, but
+; must emit the same source-composition ID. Reordering inputs must also agree.
+; The filename symbol marks profiled inputs as the instrumentation pass would.
 ; REQUIRES: x86
 ; RUN: split-file %s %t
 ; RUN: llvm-as %t/a.ll -o %t/a.bc

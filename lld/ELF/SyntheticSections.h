@@ -36,7 +36,12 @@ class Defined;
 struct PhdrEntry;
 class SymbolTableBaseSection;
 
+// This file declares linker-generated ELF sections and their supporting data.
+// Compute from native and bitcode inputs before LTO changes their composition.
+// BitcodeCompiler stores the result for Writer to use at final emission.
 llvm::Optional<std::array<uint8_t, 16>> computeMemProfModuleId();
+// Collect surviving native TU notes during final ELF construction. This is the
+// native-link fallback; it also removes TU notes superseded by the module note.
 llvm::Optional<std::array<uint8_t, 16>> collectMemProfModuleId();
 
 class SyntheticSection : public InputSection {
@@ -65,13 +70,20 @@ struct CieRecord {
   SmallVector<EhSectionPiece *, 0> fdes;
 };
 
+// One library-level note replaces the many object-level TU notes. Keeping this
+// in the synthetic-section machinery lets normal ELF layout and note handling
+// carry the identity to RawMemProfReader without changing the raw profile format.
 class MemProfModuleIdSection final : public SyntheticSection {
 public:
+  // Own the chosen digest independently of temporary collection buffers.
   explicit MemProfModuleIdSection(ArrayRef<uint8_t> id);
+  // Emit the standard note header/name plus the 16-byte digest; 36 bytes
+  // includes the padding needed to keep the descriptor four-byte aligned.
   void writeTo(uint8_t *buf) override;
   size_t getSize() const override { return 36; }
 
 private:
+  // The value hashed with function names later, not a runtime load address.
   std::array<uint8_t, 16> moduleId;
 };
 

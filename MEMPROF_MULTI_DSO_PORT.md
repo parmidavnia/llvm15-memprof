@@ -84,6 +84,36 @@ ProfileData unit tests cover module-qualified GUIDs and indexed roundtrip.
 The existing build has LLVM_INCLUDE_TESTS and COMPILER_RT_INCLUDE_TESTS OFF;
 these tests require enabling those options and building the relevant test tools.
 
-Current validation: source/API review, changed-line formatting, Python AST
-parsing, and git diff --check. Compilation and runtime validation are pending
-manual build; these changes have not yet been proved to compile or run.
+Validation: the manually built toolchain passed native, full-LTO, and ThinLTO
+multi-DSO profile checks, plus the complex workload's 14 stack checks and exact
+allocation totals. Runtime startup is still intermittent: two of five additional
+runs failed an AddrIsInMem assertion in memprof_allocator.cpp before main. The
+cause has not been established. This comment-only update does not address that
+failure; no LLVM build was run for the documentation changes.
+
+## Reading the implementation
+
+Follow the data through these layers:
+
+1. `clang/lib/CodeGen/CodeGenModule.cpp` knows the source translation unit and
+   emits its identity note. `llvm/BinaryFormat/ELF.h` is the common note-tag
+   contract used by the producer, linker, and reader.
+2. LLD's `SyntheticSections` helpers collect those identities. `LTO` preserves
+   the original input composition before optimization; `Driver` exposes that
+   saved value; `Writer` chooses it or the native fallback and emits one DSO note.
+3. `RawMemProfReader` uses build IDs to locate runtime image ranges and module
+   IDs to distinguish function names. Those are different jobs: a build ID
+   identifies a particular binary build, while a module ID depends on source
+   composition. Per-module symbolizers translate addresses to source frames.
+4. The `IndexedMemProfRecord::getGUID` overload in `MemProf` defines the shared
+   module-qualified key policy. The existing writer stores those keys and frames.
+5. `llvm-profdata` forwards a borrowed list of image paths only to raw MemProf
+   decoding. `mergeInstrProfile` remains the common merge coordinator; ordinary
+   instrumentation PGO uses its existing counter reader and merge operations.
+6. `InstrProfReader::printMemProfYAML` exposes already-indexed records for
+   inspection, without re-symbolization or a new on-disk format.
+
+Tests follow the same boundaries: CodeGen checks TU production, LLD native/LTO
+checks identity composition, ProfileData unit tests check hashing and serialized
+records, and the runtime/standalone regressions connect all of those layers.
+Inline comments explain the declarations and handoffs at their actual locations.

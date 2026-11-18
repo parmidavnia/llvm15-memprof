@@ -50,6 +50,7 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+// Shared note tags connect Clang's per-source identity to LLD and the reader.
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
 #include "llvm/IR/CallingConv.h"
@@ -67,6 +68,7 @@
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/X86TargetParser.h"
+// Keep identity metadata alive even though generated program code never reads it.
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <array>
 
@@ -79,6 +81,15 @@ static llvm::cl::opt<bool> LimitedCoverage(
 
 static const char AnnotationSection[] = "llvm.metadata";
 
+// This file turns a source translation unit into an LLVM module. Give profiled
+// ELF objects an identity here, while the main source filename is available.
+// LLD later combines these TU (translation-unit) identities into one DSO
+// (shared-library) identity; the profile reader uses that to distinguish equal
+// function names belonging to different libraries.
+//
+// Hash source identity rather than generated instructions: changing optimization
+// or code layout should not by itself rename the module in a profile. Filenames
+// and the set of participating translation units must still remain consistent.
 static void emitMemProfTUIDNote(CodeGenModule &CGM) {
   if (!CGM.getTriple().isOSBinFormatELF())
     return;
@@ -92,6 +103,9 @@ static void emitMemProfTUIDNote(CodeGenModule &CGM) {
   llvm::MD5::MD5Result TUID =
       llvm::MD5::hash(llvm::arrayRefFromStringRef(FileName));
 
+  // Package the digest as an LLVM-owned ELF note, not an application symbol.
+  // The name and descriptor padding follow the four-byte ELF note convention
+  // understood by both LLD's input parser and the profile reader.
   llvm::LLVMContext &Ctx = CGM.getLLVMContext();
   constexpr std::array<uint8_t, 8> NoteNameBytes = {'L', 'L', 'V', 'M',
                                                     0,   0,   0,   0};
@@ -106,6 +120,9 @@ static void emitMemProfTUIDNote(CodeGenModule &CGM) {
             llvm::ConstantInt::get(Int32Ty, llvm::ELF::NT_LLVM_MEMPROF_TU_ID),
             NoteName, NoteDesc});
 
+  // Emitting a private constant in this section carries the identity through
+  // object generation. compiler.used prevents optimizers from discarding it as
+  // unused data before the linker has a chance to collect it.
   auto *GV = new llvm::GlobalVariable(
       CGM.getModule(), Note->getType(), /*isConstant=*/true,
       llvm::GlobalValue::PrivateLinkage, Note, "__llvm_memprof_tu_id");
@@ -853,6 +870,8 @@ void CodeGenModule::Release() {
     getModule().addModuleFlag(
         llvm::Module::Error, "MemProfProfileFilename",
         llvm::MDString::get(Ctx, CodeGenOpts.MemoryProfileOutput));
+    // Attach identity alongside the existing request for memory profiling.
+    // Ordinary compilation and ordinary PGO do not take this path.
     emitMemProfTUIDNote(*this);
   }
 

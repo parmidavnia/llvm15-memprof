@@ -332,6 +332,9 @@ TEST_F(InstrProfTest, test_memprof) {
   EXPECT_THAT(WantRecord, EqualsRecord(Record));
 }
 
+// This file tests the indexed reader/writer contract. Feed two module-qualified
+// same-name functions through serialization so namespace separation is checked
+// beyond the hashing helper, including frame IDs and the new inspection output.
 TEST_F(InstrProfTest, test_memprof_multi_module_roundtrip) {
   ASSERT_THAT_ERROR(Writer.mergeProfileKind(InstrProfKind::MemProf),
                     Succeeded());
@@ -353,6 +356,8 @@ TEST_F(InstrProfTest, test_memprof_multi_module_roundtrip) {
   Block1.TotalSize = 111;
   Block2.AllocCount = 2;
   Block2.TotalSize = 444;
+  // Give the records distinguishable payloads so a key collision or an
+  // incorrectly reconstructed frame table cannot pass by comparing only names.
   Writer.addMemProfRecord(Guid1, makeRecord({{Id1}}, {}, Block1));
   Writer.addMemProfRecord(Guid2, makeRecord({{Id2}}, {}, Block2));
   readProfile(Writer.writeBuffer());
@@ -366,6 +371,8 @@ TEST_F(InstrProfTest, test_memprof_multi_module_roundtrip) {
   EXPECT_EQ(Record2->AllocSites[0].CallStack[0].Function, Guid2);
   EXPECT_EQ(Record1->AllocSites[0].Info.getTotalSize(), 111U);
   EXPECT_EQ(Record2->AllocSites[0].Info.getTotalSize(), 444U);
+  // The user-facing indexed display must expose both records as well as the
+  // reader API, allowing llvm-profdata users to diagnose merge results.
   std::string Output;
   raw_string_ostream OS(Output);
   ASSERT_THAT_ERROR(Reader->printMemProfYAML(OS), Succeeded());

@@ -11,6 +11,7 @@
 #include "InputFiles.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
+// Reuse the identity policy used by native ELF links before starting LTO.
 #include "SyntheticSections.h"
 #include "lld/Common/Args.h"
 #include "lld/Common/ErrorHandler.h"
@@ -186,6 +187,9 @@ static lto::Config createConfig() {
   return c;
 }
 
+// This file manages LLVM's conversion of bitcode into linker input objects.
+// Save the MemProf identity at construction time: later stages see optimized
+// output objects rather than the complete original set of source modules.
 BitcodeCompiler::BitcodeCompiler() : memProfModuleId(computeMemProfModuleId()) {
   // Initialize indexFile.
   if (!config->thinLTOIndexOnlyArg.empty())

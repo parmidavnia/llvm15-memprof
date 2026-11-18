@@ -1111,10 +1111,16 @@ IndexedInstrProfReader::getMemProfRecord(const uint64_t FuncNameHash) {
   return Record;
 }
 
+// This file reads indexed profile records. Reuse that decoding to make merged
+// MemProf stacks inspectable without loading the original DSOs again: function
+// IDs and source locations have already been resolved and stored in the index.
 Error IndexedInstrProfReader::printMemProfYAML(raw_ostream &OS) {
   if (!MemProfRecordTable)
     return make_error<InstrProfError>(instrprof_error::invalid_prof,
                                       "no memprof data available in profile");
+  // Hash-table iteration order is not a useful display order. Sorting produces
+  // stable output, and the first pass gathers a summary without retaining every
+  // expanded record in memory at once.
   SmallVector<uint64_t, 0> Keys;
   for (uint64_t Key : MemProfRecordTable->keys())
     Keys.push_back(Key);
@@ -1128,6 +1134,9 @@ Error IndexedInstrProfReader::printMemProfYAML(raw_ostream &OS) {
       ++NumAllocFunctions;
     NumMibInfo += Record->AllocSites.size();
   }
+  // Match the raw reader's record presentation for comparisons. Indexed
+  // frames do not retain the optional display names, so numeric IDs are the
+  // common identity when comparing raw and merged stacks.
   OS << "---\nMemprofProfile:\n  Summary:\n"
      << "    NumMibInfo: " << NumMibInfo << "\n"
      << "    NumAllocFunctions: " << NumAllocFunctions << "\n"

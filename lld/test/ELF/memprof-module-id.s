@@ -1,3 +1,7 @@
+# Exercise LLD's native-object stage independently of Clang by constructing
+# TU notes explicitly. A library ID must depend on input composition, remain
+# unchanged when object order changes, and replace the contributing TU notes.
+# Executables keep TU notes because this port synthesizes IDs only for DSOs.
 # REQUIRES: x86
 # RUN: split-file %s %t
 # RUN: llvm-mc -filetype=obj -triple=x86_64 %t/a.s -o %t/a.o

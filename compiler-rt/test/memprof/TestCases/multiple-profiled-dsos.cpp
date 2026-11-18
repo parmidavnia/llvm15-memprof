@@ -1,3 +1,11 @@
+// End-to-end contract: Clang emits per-object identities, LLD groups two
+// objects into each DSO, and llvm-profdata uses both DSOs to resolve one dump.
+// The executable is intentionally unprofiled/unlisted, so expected stacks end
+// at library entry functions. This does not exercise compiler profile use.
+//
+// Duplicate-image and missing-note cases must fail explicitly; argument order
+// must not change the successful result. Indexed inspection checks that the
+// two same-name allocation functions remain separate after merging.
 // REQUIRES: x86_64-linux, memprof-dynamic-runtime, lld-available
 
 // Only the two shared libraries are MemProf-instrumented. -Bsymbolic ensures
@@ -65,6 +73,7 @@ int main() {
   lib2_entry();
 }
 
+// First allocation implementation; the other library deliberately reuses its name.
 //--- a.cpp
 
 #include <cstdlib>
@@ -76,10 +85,12 @@ extern "C" __attribute__((noinline)) void shared_allocate() {
   std::free(const_cast<char *>(P));
 }
 
+// Separate caller object ensures each library combines more than one TU identity.
 //--- b.cpp
 extern "C" void shared_allocate();
 extern "C" __attribute__((noinline)) void lib1_entry() { shared_allocate(); }
 
+// A distinct allocation size makes accidental cross-library binding observable.
 //--- c.cpp
 
 #include <cstdlib>
@@ -91,6 +102,7 @@ extern "C" __attribute__((noinline)) void shared_allocate() {
   std::free(const_cast<char *>(P));
 }
 
+// The second caller gives the reader a library-specific stack above the shared name.
 //--- d.cpp
 extern "C" void shared_allocate();
 extern "C" __attribute__((noinline)) void lib2_entry() { shared_allocate(); }

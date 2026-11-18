@@ -82,9 +82,15 @@ GlobalValue::GUID IndexedMemProfRecord::getGUID(const StringRef FunctionName) {
   return Function::getGUID(FunctionName.take_front(Pos));
 }
 
+// This file implements MemProf record serialization and identity helpers.
+// A common hashing policy here lets the raw reader and any custom consumer
+// agree on module-qualified keys without altering the serialized record layout.
 GlobalValue::GUID IndexedMemProfRecord::getGUID(StringRef FunctionName,
                                                 ArrayRef<uint8_t> ModuleId) {
   MD5 Hash;
+  // A fixed domain label separates this scheme from other MD5-based IDs.
+  // Trim the same LTO promotion suffix as the legacy name-only overload so
+  // promotion does not create a different identity for the same function.
   Hash.update("MemProf module GUID");
   Hash.update(ModuleId);
   Hash.update(FunctionName.take_front(FunctionName.find(".llvm.")));

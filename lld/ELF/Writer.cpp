@@ -11,6 +11,7 @@
 #include "ARMErrataFix.h"
 #include "CallGraphSort.h"
 #include "Config.h"
+// Final ELF writing needs the original module identity saved by LTO.
 #include "Driver.h"
 #include "InputFiles.h"
 #include "LinkerScript.h"
@@ -300,9 +301,15 @@ template <class ELFT> void elf::createSyntheticSections() {
 
   auto add = [](SyntheticSection &sec) { inputSections.push_back(&sec); };
 
+  // This file assembles final ELF output. Replace TU notes with one identity
+  // for a shared library, preferring the original input-set ID saved before LTO.
+  // An unprofiled link has no ID to emit. Executables keep their existing note
+  // handling; this port only synthesizes module identities for shared objects.
   if (config->shared) {
     Optional<std::array<uint8_t, 16>> collectedId = collectMemProfModuleId();
     Optional<std::array<uint8_t, 16>> id;
+    // Native collection also consumes redundant TU notes on LTO links, but its
+    // post-optimization view must not override an available pre-LTO identity.
     if (const auto *ltoId = driver->getMemProfModuleId())
       id = *ltoId;
     if (!id)

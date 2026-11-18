@@ -632,7 +632,10 @@ public:
   /// llvm::md5(Name).
   Expected<memprof::MemProfRecord> getMemProfRecord(uint64_t FuncNameHash);
 
-  /// Print indexed MemProf records using the raw reader's YAML record format.
+  /// This reader already reconstructs indexed records and their frame tables.
+  /// Expose a MemProf-only inspection view here so llvm-profdata can compare
+  /// merged stacks with raw input. This reads existing data; it does not change
+  /// the indexed format or the ordinary instrumentation-PGO merge path.
   Error printMemProfYAML(raw_ostream &OS);
 
   /// Fill Counts with the profile data for the given function name.

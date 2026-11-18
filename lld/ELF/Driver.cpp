@@ -287,6 +287,8 @@ void LinkerDriver::addFile(StringRef path, bool withLOption) {
   }
 }
 
+// Bridge the driver-owned LTO state to Writer's final note emission. Return a
+// borrowed value: the BitcodeCompiler owns it throughout this link operation.
 const Optional<std::array<uint8_t, 16>> *
 LinkerDriver::getMemProfModuleId() const {
   return lto ? &lto->getMemProfModuleId() : nullptr;

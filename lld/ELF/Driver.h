@@ -28,6 +28,10 @@ public:
   void linkerMain(ArrayRef<const char *> args);
   void addFile(StringRef path, bool withLOption);
   void addLibrary(StringRef name);
+  // The driver coordinates LTO and final ELF writing. Let Writer retrieve the
+  // identity captured before optimization instead of deriving it from LTO's
+  // generated objects. nullptr means there is no BitcodeCompiler; an empty
+  // Optional means that compiler did not find a participating module identity.
   const llvm::Optional<std::array<uint8_t, 16>> *getMemProfModuleId() const;
 
 private:

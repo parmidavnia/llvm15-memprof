@@ -1,3 +1,7 @@
+// CodeGen produces object metadata before LLD sees the link. Check that
+// different source files carry different TU identities, and that compiling
+// without MemProf does not add this metadata to an ordinary object.
+// This is the first stage of the Clang -> LLD -> profile-reader identity flow.
 // RUN: split-file %s %t
 // RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fmemory-profile \
 // RUN:   -emit-obj %t/a.cpp -o %t/a.o

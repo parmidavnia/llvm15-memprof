@@ -1588,6 +1588,10 @@ enum : unsigned {
 // LLVM-specific notes.
 enum {
   NT_LLVM_HWASAN_GLOBALS = 3,
+  // MemProf identity has two stages: Clang labels each source object, then
+  // LLD labels the resulting shared library. Define both wire-format tags here
+  // so emitters and the profile reader agree on the meaning of each ELF note.
+  // These identities are separate from GNU build IDs used to locate mappings.
   NT_LLVM_MEMPROF_TU_ID = 0x4d505401,
   NT_LLVM_MEMPROF_MODULE_ID = 0x4d505402,
 };

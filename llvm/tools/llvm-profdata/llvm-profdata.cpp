@@ -238,6 +238,10 @@ static void overlapInput(const std::string &BaseFilename,
 }
 
 /// Load an input into a writer context.
+// This command shares its merge infrastructure between MemProf and ordinary
+// instrumentation PGO. ProfiledBinaries describes symbolization inputs, not
+// profile files or additional counter streams; only the raw MemProf branch uses
+// it. Keep the ordinary InstrProfReader/addRecord path below unchanged.
 static void loadInput(const WeightedFile &Input, SymbolRemapper *Remapper,
                       const InstrProfCorrelator *Correlator,
                       ArrayRef<StringRef> ProfiledBinaries, WriterContext *WC) {
@@ -250,6 +254,8 @@ static void loadInput(const WeightedFile &Input, SymbolRemapper *Remapper,
 
   using ::llvm::memprof::RawMemProfReader;
   if (RawMemProfReader::hasFormat(Input.Filename)) {
+    // Resolve every recorded PC against its owning supplied DSO before adding
+    // frames and allocation records to the existing writer context.
     auto ReaderOrErr =
         RawMemProfReader::create(Input.Filename, ProfiledBinaries);
     if (!ReaderOrErr) {
@@ -371,6 +377,11 @@ static void writeInstrProfile(StringRef OutputFilename,
   }
 }
 
+// Despite its name, this existing coordinator also merges raw MemProf inputs.
+// The new binary list is forwarded to loadInput; counter weights, correlation,
+// writer reduction and output policy still follow the existing implementation.
+// Inputs are the profile files; ProfiledBinaries are the images used only when
+// decoding memory-profile stacks from those files.
 static void mergeInstrProfile(const WeightedFileVector &Inputs,
                               StringRef DebugInfoFilename,
                               SymbolRemapper *Remapper,
@@ -408,6 +419,9 @@ static void mergeInstrProfile(const WeightedFileVector &Inputs,
     Contexts.emplace_back(std::make_unique<WriterContext>(
         OutputSparse, ErrorLock, WriterErrorCodes));
 
+  // Give sequential and parallel loads the same image list. ArrayRef borrows
+  // storage from merge_main, whose path strings and list remain alive until
+  // this function has waited for all worker tasks to complete.
   if (NumThreads == 1) {
     for (const auto &Input : Inputs)
       loadInput(Input, Remapper, Correlator.get(), ProfiledBinaries,
@@ -635,6 +649,8 @@ static void supplementInstrProfile(
   SmallSet<instrprof_error, 4> WriterErrorCodes;
   auto WC = std::make_unique<WriterContext>(OutputSparse, ErrorLock,
                                             WriterErrorCodes);
+  // This existing counter-profile operation needs no MemProf image lookup.
+  // The empty list replaces the old empty single-binary string.
   loadInput(Inputs[0], nullptr, nullptr, /*ProfiledBinaries=*/{}, WC.get());
   if (WC->Errors.size() > 0)
     exitWithError(std::move(WC->Errors[0].first), InstrFilename);
@@ -1014,12 +1030,15 @@ static int merge_main(int argc, const char *argv[]) {
   cl::opt<std::string> DebugInfoFilename(
       "debug-info", cl::init(""),
       cl::desc("Use the provided debug info to correlate the raw profile."));
+  // Repeatable image paths support MemProf stacks spanning multiple DSOs.
   cl::list<std::string> ProfiledBinaryPaths(
       "profiled-binary", cl::ZeroOrMore,
       cl::desc(
           "Path to a profiled binary; repeat for multiple MemProf binaries."));
 
   cl::ParseCommandLineOptions(argc, argv, "LLVM profile data merger\n");
+  // Borrow views into the option-owned strings. Both containers stay alive
+  // until the synchronous command operation (including any worker joins) ends.
   SmallVector<StringRef, 4> ProfiledBinaries;
   for (const std::string &Path : ProfiledBinaryPaths)
     ProfiledBinaries.push_back(Path);
@@ -1094,6 +1113,8 @@ static void overlapInstrProfile(const std::string &BaseFilename,
     OS << "Sum of edge counts for profile " << TestFilename << " is 0.\n";
     exit(0);
   }
+  // Overlap compares ordinary execution-counter profiles; no DSO symbolization
+  // is requested when forwarding through the shared loader.
   loadInput(WeightedInput, nullptr, nullptr, /*ProfiledBinaries=*/{}, &Context);
   overlapInput(BaseFilename, TestFilename, &Context, Overlap, FuncFilter, OS,
                IsCS);
@@ -2534,12 +2555,16 @@ static int showSampleProfile(const std::string &Filename, bool ShowCounts,
   return 0;
 }
 
+// The memory-profile display path handles both runtime dumps and merged
+// profiles. This dispatch is separate from ordinary PGO display and merging.
 static int showMemProfProfile(const std::string &Filename,
                               ArrayRef<StringRef> ProfiledBinaries,
                               raw_fd_ostream &OS) {
   auto BufferOr = MemoryBuffer::getFileOrSTDIN(Filename);
   if (std::error_code EC = BufferOr.getError())
     exitWithErrorCode(EC, Filename);
+  // A merged profile already has resolved frame records, so display those
+  // directly. No original binary paths are needed to inspect this format.
   if (IndexedInstrProfReader::hasFormat(**BufferOr)) {
     auto ReaderOr = IndexedInstrProfReader::create(std::move(*BufferOr));
     if (!ReaderOr)
@@ -2548,6 +2573,7 @@ static int showMemProfProfile(const std::string &Filename,
       exitWithError(std::move(E), Filename);
     return 0;
   }
+  // Raw dumps still contain process PCs and require the supplied image list.
   auto ReaderOr = llvm::memprof::RawMemProfReader::create(
       std::move(*BufferOr), ProfiledBinaries, /*KeepNames=*/true);
   if (Error E = ReaderOr.takeError())
@@ -2659,12 +2685,15 @@ static int show_main(int argc, const char *argv[]) {
   cl::opt<bool> ShowCovered(
       "covered", cl::init(false),
       cl::desc("Show only the functions that have been executed."));
+  // Repeatable image paths support MemProf stacks spanning multiple DSOs.
   cl::list<std::string> ProfiledBinaryPaths(
       "profiled-binary", cl::ZeroOrMore,
       cl::desc(
           "Path to a profiled binary; repeat for multiple MemProf binaries."));
 
   cl::ParseCommandLineOptions(argc, argv, "LLVM profile data summary\n");
+  // Borrow views into the option-owned strings. Both containers stay alive
+  // until the synchronous command operation (including any worker joins) ends.
   SmallVector<StringRef, 4> ProfiledBinaries;
   for (const std::string &Path : ProfiledBinaryPaths)
     ProfiledBinaries.push_back(Path);

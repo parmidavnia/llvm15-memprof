@@ -351,6 +351,9 @@ TEST(MemProf, SymbolizationFilter) {
 }
 } // namespace
 
+// Test the shared identity helper without requiring ELF files or a runtime.
+// Equal names in different libraries need different keys, while LTO promotion
+// suffixes must not rename a function. The legacy single-binary key stays distinct.
 TEST(MemProfTest, ModuleQualifiedGUID) {
   const uint8_t Module1[] = {1, 2, 3, 4};
   const uint8_t Module2[] = {4, 3, 2, 1};

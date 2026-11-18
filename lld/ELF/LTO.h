@@ -49,11 +49,15 @@ public:
 
   void add(BitcodeFile &f);
   std::vector<InputFile *> compile();
+  // LTO can combine or split source modules. Expose the original input-set
+  // identity to the ELF writer so those optimization choices do not change it.
   const llvm::Optional<std::array<uint8_t, 16>> &getMemProfModuleId() const {
     return memProfModuleId;
   }
 
 private:
+  // Capture once, before bitcode inputs are handed to LLVM and transformed.
+  // Optional keeps unprofiled links from acquiring a MemProf identity note.
   llvm::Optional<std::array<uint8_t, 16>> memProfModuleId;
   std::unique_ptr<llvm::lto::LTO> ltoObj;
   std::vector<SmallString<0>> buf;
