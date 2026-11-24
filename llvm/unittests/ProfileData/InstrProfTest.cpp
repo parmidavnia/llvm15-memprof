@@ -347,6 +347,9 @@ TEST_F(InstrProfTest, test_memprof_multi_module_roundtrip) {
   ASSERT_NE(Guid1, Guid2);
   memprof::Frame Frame1(Guid1, 2, 3, false);
   memprof::Frame Frame2(Guid2, 2, 3, false);
+  // Identical display names must survive independently under distinct GUIDs.
+  Frame1.SymbolName = "shared_allocate";
+  Frame2.SymbolName = "shared_allocate";
   auto Id1 = Frame1.hash();
   auto Id2 = Frame2.hash();
   Writer.addMemProfFrame(Id1, Frame1, Err);
@@ -369,6 +372,10 @@ TEST_F(InstrProfTest, test_memprof_multi_module_roundtrip) {
   ASSERT_EQ(Record2->AllocSites.size(), 1U);
   EXPECT_EQ(Record1->AllocSites[0].CallStack[0].Function, Guid1);
   EXPECT_EQ(Record2->AllocSites[0].CallStack[0].Function, Guid2);
+  EXPECT_EQ(Record1->AllocSites[0].CallStack[0].SymbolName,
+            Frame1.SymbolName);
+  EXPECT_EQ(Record2->AllocSites[0].CallStack[0].SymbolName,
+            Frame2.SymbolName);
   EXPECT_EQ(Record1->AllocSites[0].Info.getTotalSize(), 111U);
   EXPECT_EQ(Record2->AllocSites[0].Info.getTotalSize(), 444U);
   // The user-facing indexed display must expose both records as well as the
@@ -377,12 +384,37 @@ TEST_F(InstrProfTest, test_memprof_multi_module_roundtrip) {
   raw_string_ostream OS(Output);
   ASSERT_THAT_ERROR(Reader->printMemProfYAML(OS), Succeeded());
   OS.flush();
+  EXPECT_EQ(Output.find("SymbolName: <None>"), std::string::npos);
+  EXPECT_NE(Output.find("SymbolName: shared_allocate"), std::string::npos);
   EXPECT_NE(Output.find("NumMibInfo: 2"), std::string::npos);
   EXPECT_NE(Output.find("NumAllocFunctions: 2"), std::string::npos);
   EXPECT_NE(Output.find("FunctionGUID: " + std::to_string(Guid1)),
             std::string::npos);
   EXPECT_NE(Output.find("FunctionGUID: " + std::to_string(Guid2)),
             std::string::npos);
+}
+
+// A missing name from one input must not erase metadata from another input,
+// including when parallel merge reduces independent writer contexts.
+TEST_F(InstrProfTest, test_memprof_merge_frame_name) {
+  ASSERT_THAT_ERROR(Writer.mergeProfileKind(InstrProfKind::MemProf), Succeeded());
+  InstrProfWriter Other;
+  ASSERT_THAT_ERROR(Other.mergeProfileKind(InstrProfKind::MemProf), Succeeded());
+  memprof::Frame Unnamed(0x123, 2, 3, false);
+  memprof::Frame Named(Unnamed);
+  Named.SymbolName = "allocation";
+  auto Id = Named.hash();
+  Writer.addMemProfFrame(Id, Unnamed, Err);
+  Other.addMemProfFrame(Id, Named, Err);
+  Writer.mergeRecordsFromWriter(std::move(Other), Err);
+  // A later unnamed copy must not replace the retained name either.
+  Writer.addMemProfFrame(Id, Unnamed, Err);
+  Writer.addMemProfRecord(0x123, makeRecord({{Id}}, {}));
+  readProfile(Writer.writeBuffer());
+  auto Record = Reader->getMemProfRecord(0x123);
+  ASSERT_THAT_ERROR(Record.takeError(), Succeeded());
+  ASSERT_EQ(Record->AllocSites.size(), 1U);
+  EXPECT_EQ(Record->AllocSites[0].CallStack[0].SymbolName, Named.SymbolName);
 }
 
 TEST_F(InstrProfTest, test_memprof_getrecord_error) {

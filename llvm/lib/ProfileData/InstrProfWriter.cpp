@@ -277,6 +277,10 @@ bool InstrProfWriter::addMemProfFrame(const memprof::FrameId Id,
                                     "frame to id mapping mismatch"));
     return false;
   }
+  // Names are optional metadata, not frame identity. When writer contexts have
+  // the same numeric frame, keep an available name regardless of merge order.
+  if (!Result.first->second.SymbolName && Frame.SymbolName)
+    Result.first->second.SymbolName = Frame.SymbolName;
   return true;
 }
 

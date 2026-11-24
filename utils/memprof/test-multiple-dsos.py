@@ -17,9 +17,8 @@ def run(args, **kwargs):
     return subprocess.run(list(map(str, args)), check=True, **kwargs)
 
 
-# Compare the raw and indexed record views through the fields persisted in both.
-# Display-only symbol names and nondeterministic lifetime measurements are not
-# part of this equality check; counts, sizes and full frame identities are.
+# Require both frame identities and display names to survive merging. Lifetime
+# measurements are not part of this comparison; counts and sizes are.
 def allocations(path):
     profile = yaml.safe_load(path.read_text())['MemprofProfile']
     assert profile['Summary']['NumMibInfo'] == 2
@@ -28,8 +27,8 @@ def allocations(path):
     for record in profile['Records']:
         for site in record.get('AllocSites', []):
             stack = site['Callstack']
-            key = tuple((f['Function'], f['LineOffset'], f['Column'], f['Inline'])
-                        for f in stack)
+            key = tuple((f['Function'], f['SymbolName'], f['LineOffset'],
+                         f['Column'], f['Inline']) for f in stack)
             assert key not in result
             info = site['MemInfoBlock']
             result[key] = (info['AllocCount'], info['TotalSize'])
@@ -110,7 +109,9 @@ def main():
          '-o', out / 'indexed.yaml'], env=env)
     profile, raw_sites = allocations(out / 'raw.yaml')
     _, indexed_sites = allocations(out / 'indexed.yaml')
-    assert raw_sites == indexed_sites
+    assert raw_sites == indexed_sites, 'Merged frame names or payloads changed'
+    assert all(frame[1] not in (None, '<None>')
+               for stack in indexed_sites for frame in stack)
     # Separate GUIDs alone are insufficient: confirm that each allocation is
     # attached to its own caller and its known size/count, not merely renamed.
     leaves = set()

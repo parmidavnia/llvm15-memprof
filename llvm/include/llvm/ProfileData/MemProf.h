@@ -142,8 +142,9 @@ struct Frame {
   // A uuid (uint64_t) identifying the function. It is obtained by
   // llvm::md5(FunctionName) which returns the lower 64 bits.
   GlobalValue::GUID Function;
-  // The symbol name for the function. Only populated in the Frame by the reader
-  // if requested during initialization. This field should not be serialized.
+  // Optional display name, populated when the raw reader is asked to retain
+  // names. The indexed frame-table trait preserves it as a trailing payload;
+  // it is not part of the numeric frame identity or the legacy fixed prefix.
   llvm::Optional<std::string> SymbolName;
   // The source line offset of the call from the beginning of parent function.
   uint32_t LineOffset;
@@ -182,7 +183,9 @@ struct Frame {
 
   bool operator!=(const Frame &Other) const { return !operator==(Other); }
 
-  // Write the contents of the frame to the ostream \p OS.
+  // Write the legacy fixed-size numeric prefix. FrameWriterTrait appends the
+  // optional display name for indexed profiles; keeping this prefix unchanged
+  // lets existing numeric-only readers continue to interpret frame identities.
   void serialize(raw_ostream &OS) const {
     using namespace support;
 
@@ -211,7 +214,7 @@ struct Frame {
                  /*IsInlineFrame=*/I);
   }
 
-  // Returns the size of the frame information.
+  // Size of the legacy numeric prefix, excluding any optional indexed name.
   static constexpr size_t serializedSize() {
     return sizeof(Frame::Function) + sizeof(Frame::LineOffset) +
            sizeof(Frame::Column) + sizeof(Frame::IsInlineFrame);
@@ -561,7 +564,10 @@ public:
     endian::Writer LE(Out, little);
     offset_type N = sizeof(K);
     LE.write<offset_type>(N);
-    offset_type M = V.serializedSize();
+    // The table already stores each payload's byte length. Use any bytes after
+    // the fixed prefix for the name, with no terminator or separate length.
+    offset_type M = V.serializedSize() +
+                    (V.SymbolName ? V.SymbolName->size() : 0);
     LE.write<offset_type>(M);
     return std::make_pair(N, M);
   }
@@ -575,6 +581,8 @@ public:
   void EmitData(raw_ostream &Out, key_type_ref /*Unused*/, data_type_ref V,
                 offset_type /*Unused*/) {
     V.serialize(Out);
+    if (V.SymbolName)
+      Out << *V.SymbolName;
   }
 };
 
@@ -610,8 +618,16 @@ public:
   }
 
   data_type ReadData(uint64_t K, const unsigned char *D,
-                     offset_type /*Unused*/) {
-    return Frame::deserialize(D);
+                     offset_type DataLen) {
+    Frame Result = Frame::deserialize(D);
+    // Legacy payloads end at the numeric prefix. New payloads may append a
+    // name; the table's recorded length bounds it and keeps adjacent entries
+    // separate. Original LLVM 15 readers ignore this suffix and keep the GUID.
+    if (DataLen > Frame::serializedSize())
+      Result.SymbolName =
+          StringRef(reinterpret_cast<const char *>(D + Frame::serializedSize()),
+                    DataLen - Frame::serializedSize()).str();
+    return Result;
   }
 };
 } // namespace memprof

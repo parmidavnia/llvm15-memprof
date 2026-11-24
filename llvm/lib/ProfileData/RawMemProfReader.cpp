@@ -675,15 +675,16 @@ Error RawMemProfReader::symbolizeAndFilterStackFrames() {
         const uint32_t LineOffset = DIFrame.Line >= DIFrame.StartLine
                                         ? DIFrame.Line - DIFrame.StartLine
                                         : 0;
-        const Frame F(Guid, LineOffset, DIFrame.Column,
+        Frame F(Guid, LineOffset, DIFrame.Column,
                       // Only the last entry is not an inlined location.
                       I != NumFrames - 1);
-        // Here we retain a mapping from the GUID to symbol name instead of
-        // adding it to the frame object directly to reduce memory overhead.
-        // This is because there can be many unique frames, particularly for
-        // callsite frames.
-        if (KeepSymbolName)
+        // Merge consumes IdToFrame directly, rather than the record iterator
+        // below. Keep names on those frames as well so the indexed writer can
+        // preserve them. The GUID-to-name map still serves iterator clients.
+        if (KeepSymbolName) {
+          F.SymbolName = DIFrame.FunctionName;
           GuidToSymbolName.insert({Guid, DIFrame.FunctionName});
+        }
 
         const FrameId Hash = F.hash();
         IdToFrame.insert({Hash, F});

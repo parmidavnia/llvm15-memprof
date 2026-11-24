@@ -59,6 +59,10 @@
 // INDEXED-NEXT: NumAllocFunctions: 2
 // INDEXED-DAG: TotalSize: 111
 // INDEXED-DAG: TotalSize: 222
+// INDEXED-DAG: SymbolName: shared_allocate
+// INDEXED-DAG: SymbolName: shared_allocate
+// INDEXED-DAG: SymbolName: lib1_entry
+// INDEXED-DAG: SymbolName: lib2_entry
 
 // MISSING-ID: error: No MemProf module ID found in binary
 // DUPLICATE: error: Duplicate profiled binary build id:

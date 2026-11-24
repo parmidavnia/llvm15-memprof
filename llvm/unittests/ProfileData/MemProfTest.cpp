@@ -363,3 +363,34 @@ TEST(MemProfTest, ModuleQualifiedGUID) {
   EXPECT_EQ(First,
             IndexedMemProfRecord::getGUID("shared_allocate.llvm.123", Module1));
 }
+
+// Fixed-prefix frames from old profiles remain readable without a name. The
+// bounded suffix is optional and must not change frame equality or hashing.
+TEST(MemProfTest, IndexedFrameOptionalName) {
+  Frame Original(123, 4, 5, false);
+  std::string Bytes;
+  llvm::raw_string_ostream OS(Bytes);
+  Original.serialize(OS);
+  OS.flush();
+  ASSERT_EQ(Bytes.size(), Frame::serializedSize());
+  llvm::memprof::FrameLookupTrait Reader;
+  auto Legacy = Reader.ReadData(Original.hash(),
+      reinterpret_cast<const unsigned char *>(Bytes.data()), Bytes.size());
+  EXPECT_EQ(Legacy, Original);
+  EXPECT_FALSE(Legacy.SymbolName.has_value());
+
+  Bytes += "shared_allocate";
+  // Extra bytes from a neighboring entry must not be included in the name.
+  const size_t PayloadSize = Bytes.size();
+  Bytes += "not_part_of_name";
+  auto Named = Reader.ReadData(Original.hash(),
+      reinterpret_cast<const unsigned char *>(Bytes.data()), PayloadSize);
+  ASSERT_TRUE(Named.SymbolName.has_value());
+  EXPECT_EQ(*Named.SymbolName, "shared_allocate");
+  EXPECT_EQ(Named, Original);
+  EXPECT_EQ(Named.hash(), Original.hash());
+  // The old numeric deserializer can still read the unchanged prefix.
+  auto Numeric = Frame::deserialize(
+      reinterpret_cast<const unsigned char *>(Bytes.data()));
+  EXPECT_EQ(Numeric, Original);
+}

@@ -16,10 +16,12 @@ original local baseline 5dc64f474220).
   distinguish identical function names across DSOs. Single-binary GUIDs remain
   compatible with the older name-only scheme.
 - Indexed memory profiles can be inspected with llvm-profdata show --memory,
-  using the existing LLVM 15 record format rather than a newer indexed format.
+  retaining the LLVM 15 numeric frame prefix and record layout. An optional
+  frame-payload suffix now preserves symbol names for standalone inspection.
 
-The existing runtime, SIGUSR2 dump behavior, MIB extensions, and raw/indexed
-profile layouts are retained. Keep the LLVM 15 runtime and tools paired; this
+The existing runtime, SIGUSR2 dump behavior, MIB extensions, and raw profile
+layout are retained. Indexed frame payloads may now carry optional symbol names
+following the unchanged numeric prefix. Keep the LLVM 15 runtime and tools paired; this
 port does not make their raw format compatible with LLVM 24's runtime.
 
 ## LLVM 15 adaptations and scope
@@ -111,9 +113,32 @@ Follow the data through these layers:
    decoding. `mergeInstrProfile` remains the common merge coordinator; ordinary
    instrumentation PGO uses its existing counter reader and merge operations.
 6. `InstrProfReader::printMemProfYAML` exposes already-indexed records for
-   inspection, without re-symbolization or a new on-disk format.
+   inspection, without re-symbolization. FrameWriterTrait and FrameLookupTrait
+   preserve optional names in the indexed payload, after its numeric prefix.
 
 Tests follow the same boundaries: CodeGen checks TU production, LLD native/LTO
 checks identity composition, ProfileData unit tests check hashing and serialized
 records, and the runtime/standalone regressions connect all of those layers.
 Inline comments explain the declarations and handoffs at their actual locations.
+
+## Symbol names in merged profiles
+
+Raw merges request names from the symbolizer and retain them on the frames
+passed to the writer. The frame hash-table payload contains its original
+17-byte numeric prefix followed by the optional name bytes. The table's existing
+payload length bounds the name; no new length field, runtime format, or ordinary
+PGO record change is needed. Hashing/equality still depend only on numeric frame
+identity. When writer contexts combine, an existing name is retained and a
+missing name can be filled from the other context.
+
+This is a local indexed-MemProf payload extension. This updated reader also
+accepts legacy numeric-only frames, displaying `<None>` for them. The original
+LLVM 15 frame lookup reads the unchanged prefix and ignores a suffix because the
+table already carries payload lengths. Compatibility with unrelated newer LLVM
+MemProf formats is not implied. Existing indexed files have already lost their
+names: regenerate them from raw profiles with the updated llvm-profdata.
+
+The standalone smoke test now compares symbol names as well as full frame
+identities and allocation counts/sizes after merge -> show. Unit tests cover old
+numeric-only frames, bounded name decoding, duplicate names under different
+module GUIDs, and combining named/unnamed copies of a frame.

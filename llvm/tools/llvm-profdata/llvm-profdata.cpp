@@ -257,7 +257,8 @@ static void loadInput(const WeightedFile &Input, SymbolRemapper *Remapper,
     // Resolve every recorded PC against its owning supplied DSO before adding
     // frames and allocation records to the existing writer context.
     auto ReaderOrErr =
-        RawMemProfReader::create(Input.Filename, ProfiledBinaries);
+        RawMemProfReader::create(Input.Filename, ProfiledBinaries,
+                                 /*KeepName=*/true);
     if (!ReaderOrErr) {
       exitWithError(ReaderOrErr.takeError(), Input.Filename);
     }
@@ -279,7 +280,9 @@ static void loadInput(const WeightedFile &Input, SymbolRemapper *Remapper,
       WC->Errors.emplace_back(make_error<InstrProfError>(IPE), Filename);
     };
 
-    // Add the frame mappings into the writer context.
+    // Keep the resolved display names with frame mappings so show --memory on
+    // the merged file does not require the original binaries to recover names.
+    // Ordinary PGO inputs do not pass through this MemProf-only branch.
     const auto &IdToFrame = Reader->getFrameMapping();
     for (const auto &I : IdToFrame) {
       bool Succeeded = WC->Writer.addMemProfFrame(

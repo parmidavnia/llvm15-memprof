@@ -1134,9 +1134,9 @@ Error IndexedInstrProfReader::printMemProfYAML(raw_ostream &OS) {
       ++NumAllocFunctions;
     NumMibInfo += Record->AllocSites.size();
   }
-  // Match the raw reader's record presentation for comparisons. Indexed
-  // frames do not retain the optional display names, so numeric IDs are the
-  // common identity when comparing raw and merged stacks.
+  // Match the raw reader's record presentation for comparisons. New indexed
+  // frame payloads retain optional display names; legacy numeric-only frames
+  // still print <None> because those names cannot be recovered from their GUIDs.
   OS << "---\nMemprofProfile:\n  Summary:\n"
      << "    NumMibInfo: " << NumMibInfo << "\n"
      << "    NumAllocFunctions: " << NumAllocFunctions << "\n"
